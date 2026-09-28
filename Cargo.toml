@@ -1,0 +1,19 @@
+[package]
+name = "soothsay"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Read the omens before you `curl | sh`: explains what a shell install script will do to your machine, before it does it."
+license = "MIT"
+readme = "README.md"
+keywords = ["security", "shell", "installer", "static-analysis", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+# Deliberately none. A tool you pipe untrusted scripts into should be small
+# enough to audit in an afternoon.
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
