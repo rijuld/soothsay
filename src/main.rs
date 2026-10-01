@@ -26,6 +26,10 @@ OPTIONS
                            (comma-separated ids, or \"all\")
         --fail-on <SEV>    Exit 1 if any finding is at least this severe
                            (notice | warn | danger)
+        --ignore-unreachable
+                           Let --deny / --fail-on skip findings in functions
+                           that look never-called (off by default: a script
+                           can hide how it calls them)
         --categories       List category ids and exit
         --no-color         Disable colour (also honours NO_COLOR)
     -h, --help             Show this help
@@ -49,6 +53,7 @@ struct Args {
     shell: Option<String>,
     deny: Vec<Category>,
     fail_on: Option<Severity>,
+    ignore_unreachable: bool,
     color: bool,
     script_args: Vec<String>,
 }
@@ -68,6 +73,7 @@ fn parse_args() -> Args {
         shell: None,
         deny: Vec::new(),
         fail_on: None,
+        ignore_unreachable: false,
         color: std::env::var_os("NO_COLOR").is_none() && io::stdout().is_terminal(),
         script_args: Vec::new(),
     };
@@ -103,6 +109,7 @@ fn parse_args() -> Args {
             "--run" => a.run = true,
             "-y" | "--yes" => a.yes = true,
             "--no-color" => a.color = false,
+            "--ignore-unreachable" => a.ignore_unreachable = true,
             "--shell" => a.shell = Some(value("--shell")),
             "--deny" => {
                 let v = value("--deny");
@@ -182,7 +189,7 @@ fn main() {
     let denied: Vec<_> = report
         .findings
         .iter()
-        .filter(|f| f.reachable)
+        .filter(|f| f.reachable || !args.ignore_unreachable)
         .filter(|f| {
             args.deny.contains(&f.category) || args.fail_on.is_some_and(|s| f.severity >= s)
         })
