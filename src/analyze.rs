@@ -262,7 +262,8 @@ pub fn analyze(src: &str) -> Report {
     }
     a.run(&script);
 
-    // Which functions can actually run? Start from top-level calls and follow.
+    // Which functions can actually run? Start from top-level calls and the
+    // shell's own hooks, and follow.
     let defined: HashSet<&str> = a.defined.iter().map(|(n, _)| n.as_str()).collect();
     let mut live: HashSet<String> = HashSet::new();
     let mut frontier: Vec<String> = a
@@ -270,6 +271,12 @@ pub fn analyze(src: &str) -> Report {
         .iter()
         .filter(|(from, to)| from.is_none() && defined.contains(to.as_str()))
         .map(|(_, to)| to.clone())
+        .chain(
+            defined
+                .iter()
+                .filter(|n| is_shell_hook(n))
+                .map(|n| n.to_string()),
+        )
         .collect();
     while let Some(f) = frontier.pop() {
         if live.insert(f.clone()) {
@@ -282,6 +289,17 @@ pub fn analyze(src: &str) -> Report {
                 }
             }
         }
+    }
+    // A command name soothsay can't resolve (`"$@"`, `${1:-main}`, a decoded
+    // string) could call any function, so none of them can be ruled out.
+    let dynamic = a.calls.iter().any(|(from, to)| {
+        to == DYNAMIC_CALL
+            && from
+                .as_deref()
+                .map_or(true, |f| live.contains(f) || !defined.contains(f))
+    });
+    if dynamic {
+        live.extend(defined.iter().map(|n| n.to_string()));
     }
     let reachable = |function: &Option<String>| match function {
         None => true,
@@ -310,6 +328,115 @@ pub fn analyze(src: &str) -> Report {
         files: a.files,
         urls: a.urls,
         functions,
+    }
+}
+
+/// Recorded in `calls` for a command whose name can't be known statically.
+const DYNAMIC_CALL: &str = "\0dynamic";
+
+/// Functions the shell itself calls: bash/zsh hooks and zsh's `TRAPINT` & co.
+fn is_shell_hook(name: &str) -> bool {
+    matches!(
+        name,
+        "command_not_found_handle"
+            | "command_not_found_handler"
+            | "precmd"
+            | "preexec"
+            | "chpwd"
+            | "periodic"
+            | "zshexit"
+            | "zshaddhistory"
+    ) || name.strip_prefix("TRAP").is_some_and(|sig| {
+        !sig.is_empty()
+            && sig
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    })
+}
+
+/// True if `s`, a resolved word, still names something unknown (`${x}`,
+/// `$(…)`) and nothing outside those placeholders makes it a path.
+fn unknown_name(s: &str) -> bool {
+    if !s.contains("${") && !s.contains("$(") {
+        return false;
+    }
+    let mut rest = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '$' && matches!(chars.peek(), Some('{') | Some('(')) {
+            let (open, close) = if chars.next() == Some('{') {
+                ('{', '}')
+            } else {
+                ('(', ')')
+            };
+            let mut depth = 1;
+            for n in chars.by_ref() {
+                if n == open {
+                    depth += 1;
+                } else if n == close {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+        } else {
+            rest.push(c);
+        }
+    }
+    !rest.contains('/')
+}
+
+impl Analyzer {
+    /// Functions a command might call besides `h.name`, or `None` if its
+    /// name is built at runtime and could be anything.
+    fn call_targets(&self, h: &Head, function: &Option<String>) -> Option<Vec<String>> {
+        match h.name.as_str() {
+            "eval" if h.words[1..].iter().any(|w| w.literal().is_none()) => return None,
+            "trap"
+                if h.words
+                    .get(1)
+                    .is_some_and(|w| unknown_name(&self.resolve(w))) =>
+            {
+                return None
+            }
+            _ => {}
+        }
+        let first = h.words.first()?;
+        // An unquoted `$f` holding `$(…)` arrives here already split into words.
+        if let Some(l) = first.literal() {
+            return if unknown_name(&l) {
+                None
+            } else {
+                Some(Vec::new())
+            };
+        }
+        if let [Part::Param { name, fallback }] = first.parts.as_slice() {
+            let positional = name == "@" || name == "*" || name.chars().all(|c| c.is_ascii_digit());
+            if positional {
+                // `ensure() { "$@" || exit 1; }`: each call site names the command.
+                if function.is_some() && (name == "@" || name == "*") && fallback.is_none() {
+                    return Some(Vec::new());
+                }
+                return None;
+            }
+            if let Some(vals) = self.ever.get(name) {
+                let mut names = Vec::new();
+                for v in vals {
+                    if unknown_name(v) {
+                        return None;
+                    }
+                    if let Some(n) = v.split_whitespace().next() {
+                        names.push(basename(n).to_string());
+                    }
+                }
+                return Some(names);
+            }
+        }
+        if unknown_name(&h.args[0]) {
+            return None;
+        }
+        Some(Vec::new())
     }
 }
 
@@ -827,6 +954,16 @@ impl Analyzer {
             return;
         };
         self.calls.push((cmd.function.clone(), h.name.clone()));
+        match self.call_targets(&h, &cmd.function) {
+            Some(names) => {
+                for n in names {
+                    self.calls.push((cmd.function.clone(), n));
+                }
+            }
+            None => self
+                .calls
+                .push((cmd.function.clone(), DYNAMIC_CALL.to_string())),
+        }
         let ctx = Ctx {
             line: cmd.line,
             function: &cmd.function,
