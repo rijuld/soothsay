@@ -160,7 +160,7 @@ pub struct Finding {
     pub as_root: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Touch {
     Write,
     Append,
@@ -493,6 +493,11 @@ struct Analyzer {
     sudo_wrappers: HashSet<String>,
     arrays: HashMap<String, Vec<String>>,
     depth: usize,
+    /// Dedup indexes into `findings` / `files`, so big scripts stay linear.
+    /// An entry is only trusted if the index still holds a matching item,
+    /// since `findings` can be truncated.
+    finding_index: HashMap<(Category, usize, String), usize>,
+    file_index: HashSet<(String, Touch)>,
 }
 
 struct Ctx<'a> {
@@ -537,11 +542,15 @@ impl Analyzer {
         message: String,
         detail: Option<String>,
     ) {
-        let dup = self
-            .findings
-            .iter()
-            .any(|f| f.category == cat && f.line == ctx.line && f.message == message);
+        let key = (cat, ctx.line, message);
+        let dup = self.finding_index.get(&key).is_some_and(|&i| {
+            self.findings
+                .get(i)
+                .is_some_and(|f| f.category == key.0 && f.line == key.1 && f.message == key.2)
+        });
         if !dup {
+            let (_, _, message) = key.clone();
+            self.finding_index.insert(key, self.findings.len());
             self.findings.push(Finding {
                 category: cat,
                 severity: sev,
@@ -1081,7 +1090,7 @@ impl Analyzer {
             }
             return;
         }
-        if !self.files.iter().any(|f| f.path == path && f.how == how) {
+        if self.file_index.insert((path.clone(), how)) {
             self.files.push(FileTouch {
                 path: path.clone(),
                 how,
