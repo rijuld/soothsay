@@ -1,0 +1,4 @@
+contact_links:
+  - name: Report a security issue (a hostile script gets a clean verdict, report injection, crash)
+    url: https://github.com/rijuld/soothsay/security/advisories/new
+    about: Please report these privately. See SECURITY.md.
