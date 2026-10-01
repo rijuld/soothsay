@@ -22,6 +22,9 @@ OPTIONS
                            *exact bytes* that were analyzed (never re-downloads)
     -y, --yes              With --run: don't ask (policy flags still apply)
         --shell <SH>       Interpreter for --run (default: the script's shebang, else sh)
+        --expect-sha256 <HEX>
+                           Exit 1 unless the script's sha256 is exactly this
+                           (pin the bytes you reviewed earlier)
         --deny <CATS>      Exit 1 if any finding is in these categories
                            (comma-separated ids, or \"all\")
         --fail-on <SEV>    Exit 1 if any finding is at least this severe
@@ -41,8 +44,16 @@ OPTIONS
 EXIT STATUS
     0  report printed (and, with --run, the script's own exit status)
     1  a --deny / --fail-on policy matched
-    2  usage or I/O error
+    1  --expect-sha256 did not match
+    2  usage or I/O error, or input that isn't a shell script
+       (empty, HTML, binary, or over 16 MiB)
 ";
+
+/// Refuse anything bigger: no real installer is this large.
+const MAX_INPUT: u64 = 16 * 1024 * 1024;
+
+/// Shells whose syntax soothsay actually understands.
+const KNOWN_SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "mksh", "ash"];
 
 struct Args {
     file: Option<String>,
@@ -51,6 +62,7 @@ struct Args {
     run: bool,
     yes: bool,
     shell: Option<String>,
+    expect_sha256: Option<String>,
     deny: Vec<Category>,
     fail_on: Option<Severity>,
     ignore_unreachable: bool,
@@ -59,8 +71,12 @@ struct Args {
 }
 
 fn die(msg: &str) -> ! {
+    die_with(2, msg)
+}
+
+fn die_with(code: i32, msg: &str) -> ! {
     eprintln!("soothsay: {msg}");
-    process::exit(2);
+    process::exit(code);
 }
 
 fn parse_args() -> Args {
@@ -71,6 +87,7 @@ fn parse_args() -> Args {
         run: false,
         yes: false,
         shell: None,
+        expect_sha256: None,
         deny: Vec::new(),
         fail_on: None,
         ignore_unreachable: false,
@@ -111,6 +128,13 @@ fn parse_args() -> Args {
             "--no-color" => a.color = false,
             "--ignore-unreachable" => a.ignore_unreachable = true,
             "--shell" => a.shell = Some(value("--shell")),
+            "--expect-sha256" => {
+                let v = value("--expect-sha256").to_ascii_lowercase();
+                if v.len() != 64 || !v.chars().all(|c| c.is_ascii_hexdigit()) {
+                    die("--expect-sha256 needs a full 64-character hex sha256");
+                }
+                a.expect_sha256 = Some(v);
+            }
             "--deny" => {
                 let v = value("--deny");
                 for id in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -155,19 +179,44 @@ fn main() {
                 eprint!("{HELP}");
                 process::exit(2);
             }
-            let mut buf = Vec::new();
-            io::stdin()
-                .read_to_end(&mut buf)
-                .unwrap_or_else(|e| die(&format!("reading stdin: {e}")));
+            let buf =
+                read_capped(io::stdin()).unwrap_or_else(|e| die(&format!("reading stdin: {e}")));
             ("stdin".to_string(), buf)
         }
         Some(path) => {
-            let buf = fs::read(path).unwrap_or_else(|e| die(&format!("{path}: {e}")));
+            let buf = File::open(path)
+                .and_then(read_capped)
+                .unwrap_or_else(|e| die(&format!("{path}: {e}")));
             (path.rsplit('/').next().unwrap_or(path).to_string(), buf)
         }
     };
-    let src = String::from_utf8_lossy(&bytes);
-    let report = soothsay::analyze(&src);
+    if bytes.len() as u64 > MAX_INPUT {
+        die("input is over 16 MiB; that's not an install script, refusing to read it");
+    }
+    if let Some(why) = not_a_script(&bytes) {
+        die(why);
+    }
+    let report = soothsay::analyze_bytes(&bytes);
+    if let Some(want) = &args.expect_sha256 {
+        if *want != report.sha256 {
+            die_with(
+                1,
+                &format!(
+                    "sha256 mismatch: expected {want}, got {}; these are not the bytes you pinned",
+                    report.sha256
+                ),
+            );
+        }
+    }
+
+    let shell_script = KNOWN_SHELLS.contains(&report.interpreter.as_str());
+    if !shell_script {
+        eprintln!(
+            "soothsay: WARNING: this is a {} script (per its #! line). soothsay only reads \
+             shell, so the report below says nothing about what it will do.",
+            report.interpreter
+        );
+    }
 
     if args.json {
         print!("{}", render::json(&report, &source));
@@ -207,14 +256,17 @@ fn main() {
     }
 
     if args.run {
-        let shell = args.shell.clone().unwrap_or_else(|| {
-            let i = report.interpreter.as_str();
-            if matches!(i, "sh" | "bash" | "zsh" | "dash" | "ksh") {
-                i.to_string()
-            } else {
-                "sh".into()
-            }
-        });
+        if !shell_script && args.shell.is_none() {
+            eprintln!(
+                "soothsay: not running a {} script as shell; pass --shell <interpreter> if you really mean to",
+                report.interpreter
+            );
+            process::exit(2);
+        }
+        let shell = args
+            .shell
+            .clone()
+            .unwrap_or_else(|| report.interpreter.clone());
         process::exit(run(&bytes, &report.sha256, &shell, &args));
     }
 }
@@ -272,10 +324,51 @@ fn run(bytes: &[u8], sha: &str, shell: &str, args: &Args) -> i32 {
         .status();
     let _ = fs::remove_file(&path);
     match status {
-        Ok(s) => s.code().unwrap_or(1),
+        Ok(s) => exit_code(s),
         Err(e) => {
             eprintln!("soothsay: running {shell}: {e}");
             2
         }
     }
+}
+
+/// Read at most one byte past [`MAX_INPUT`], so oversize input is detected
+/// without buffering all of it.
+fn read_capped(r: impl Read) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    r.take(MAX_INPUT + 1).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// Inputs that are clearly not a shell script, with the reason to give.
+fn not_a_script(bytes: &[u8]) -> Option<&'static str> {
+    let Some(start) = bytes.iter().position(|b| !b.is_ascii_whitespace()) else {
+        return Some("empty input: did the download fail? (curl -f prints nothing on HTTP errors)");
+    };
+    if bytes.contains(&0) {
+        return Some("input contains NUL bytes: this isn't a shell script");
+    }
+    let head = &bytes[start..bytes.len().min(start + 9)];
+    if head.eq_ignore_ascii_case(b"<!doctype")
+        || head
+            .get(..5)
+            .is_some_and(|h| h.eq_ignore_ascii_case(b"<html"))
+    {
+        return Some(
+            "input looks like an HTML page, not a shell script (wrong URL, or an error page?)",
+        );
+    }
+    None
+}
+
+/// The script's exit status, or 128+N if signal N killed it, as shells report it.
+fn exit_code(s: process::ExitStatus) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = s.signal() {
+            return 128 + sig;
+        }
+    }
+    s.code().unwrap_or(1)
 }
