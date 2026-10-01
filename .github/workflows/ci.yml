@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     strategy:
@@ -12,14 +15,37 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # dtolnay/rust-toolchain has no version tags; this is the `stable` branch head.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: rustfmt, clippy
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
       - name: Dogfood on the fixtures
         run: |
-          cargo run -q -- tests/fixtures/typical.sh
-          ! cargo run -q -- --fail-on danger tests/fixtures/nasty.sh
+          cargo run -q --locked -- tests/fixtures/typical.sh
+          # The policy must fail with exactly 1. A crash (101, 134, ...) or a
+          # usage error (2) is not "the policy caught it".
+          set +e
+          cargo run -q --locked -- --fail-on danger tests/fixtures/nasty.sh >/dev/null
+          code=$?
+          set -e
+          if [ "$code" -ne 1 ]; then
+            echo "expected exit 1 from --fail-on danger, got $code" >&2
+            exit 1
+          fi
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # The `1.74.0` branch of dtolnay/rust-toolchain; keep in sync with rust-version in Cargo.toml.
+      - uses: dtolnay/rust-toolchain@efed8f656eb82c29ac527034a28c68b8e6261caa # 1.74.0
+      - run: cargo build --locked
+      - run: cargo test --locked
