@@ -130,9 +130,21 @@ That's a well-behaved installer. Here's an excerpt of the report for
 
 ## Install
 
+Prebuilt binaries for macOS and Linux (x86_64 and arm64) are on the
+[releases page](https://github.com/rijuld/soothsay/releases/latest). Download yours, then
+check the hash and the build attestation before you put it on your `PATH`:
+
 ```sh
-git clone https://github.com/rijuld/soothsay && cd soothsay
-cargo install --path .
+gh release download v0.1.0 --repo rijuld/soothsay -p SHA256SUMS -p '*aarch64-apple-darwin*'
+sha256sum -c SHA256SUMS --ignore-missing
+gh attestation verify soothsay-v0.1.0-aarch64-apple-darwin.tar.gz --repo rijuld/soothsay
+tar xzf soothsay-v0.1.0-aarch64-apple-darwin.tar.gz
+```
+
+Or build it with Cargo:
+
+```sh
+cargo install --locked --git https://github.com/rijuld/soothsay --tag v0.1.0
 ```
 
 It's a single small binary with **zero dependencies**. That's on purpose: a tool you
@@ -140,14 +152,9 @@ pipe untrusted scripts into should be small enough to audit in an afternoon. The
 thing is a few thousand lines of plain Rust. (It isn't on crates.io yet; publishing it is
 on the [roadmap](#roadmap).)
 
-Tagged releases attach prebuilt binaries, a `SHA256SUMS` file and a
-[build provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations).
-Once a release exists, prefer it over building from `main`, and verify it:
-
-```sh
-sha256sum -c SHA256SUMS --ignore-missing
-gh attestation verify soothsay-<version>-<target>.tar.gz --repo rijuld/soothsay
-```
+Every release attaches a `SHA256SUMS` file and a
+[build provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations)
+proving the binaries were built from this repo by its release workflow.
 
 ## Usage
 
@@ -185,9 +192,8 @@ If you maintain an `install.sh`, soothsay can keep it honest across PRs:
 
 ```yaml
 # .github/workflows/installer.yml
-# Pin the commit you reviewed (or a release tag, once there are some).
-# Never install a security tool from a moving branch.
-- run: cargo install --locked --git https://github.com/rijuld/soothsay --rev <commit-sha>
+# Pin a release tag (or a commit with --rev). Never install a security tool from a moving branch.
+- run: cargo install --locked --git https://github.com/rijuld/soothsay --tag v0.1.0
 - run: soothsay --deny persistence,remote-exec,obfuscation --fail-on danger install.sh
 ```
 
