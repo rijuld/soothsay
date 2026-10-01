@@ -1,7 +1,7 @@
 //! Turns tokens into a flat list of simple commands, remembering which
 //! pipeline each belongs to and which function (if any) encloses it.
 
-use crate::lexer::{tokenize, Redirect, Token, Word};
+use crate::lexer::{tokenize, Part, Redirect, Token, Word};
 
 /// One simple command, e.g. `sudo mv "$tmp/bin" /usr/local/bin >/dev/null`.
 #[derive(Debug, Clone)]
@@ -46,6 +46,8 @@ pub fn parse(src: &str, offset: usize, function: Option<String>) -> Script {
         pipeline: 0,
         stage: 0,
         scopes: vec![function],
+        group_starts: Vec::new(),
+        closed_group: None,
         cases: Vec::new(),
         pending_func: None,
         expect_fn_name: false,
@@ -100,6 +102,11 @@ struct Parser {
     stage: usize,
     /// Brace groups / subshells, each remembering its enclosing function.
     scopes: Vec<Option<String>>,
+    /// Index of the first command inside each open `{ … }` / `( … )` group.
+    group_starts: Vec<usize>,
+    /// First command of a group that just closed, so `{ …; } | sh` can join
+    /// the group to the pipeline that follows it.
+    closed_group: Option<usize>,
     cases: Vec<Case>,
     pending_func: Option<String>,
     expect_fn_name: bool,
@@ -122,31 +129,63 @@ impl Parser {
     fn open_scope(&mut self) {
         let f = self.pending_func.take().or_else(|| self.current_func());
         self.scopes.push(f);
+        self.group_starts.push(self.script.commands.len());
+        self.closed_group = None;
     }
 
     fn close_scope(&mut self) {
         if self.scopes.len() > 1 {
             self.scopes.pop();
         }
+        self.closed_group = self.group_starts.pop();
+    }
+
+    /// Keep a word whose expansions run code (`$(…)`, `<(…)`, `$((…))`) even
+    /// where the word itself isn't a command, as in a `for`/`case` header.
+    /// It becomes an argument of a synthetic `:` so the analyzer still looks
+    /// inside it.
+    fn keep_code(&mut self, w: &Word, l: usize) {
+        if !runs_code(&w.parts) {
+            return;
+        }
+        if self.words.is_empty() {
+            self.line = l;
+            self.words.push(Word {
+                parts: vec![Part::Lit(":".into())],
+                quoted: false,
+            });
+        }
+        self.words.push(w.clone());
     }
 
     fn word(&mut self, w: &Word, l: usize) {
-        if self.skip_to_sep {
-            return;
-        }
         let bare = w.bare();
         let kw = bare.as_deref();
+        if kw != Some("}") {
+            self.closed_group = None;
+        }
+        if self.skip_to_sep {
+            // `for x in $(curl … | sh)`: the list is expanded, so its code runs.
+            return self.keep_code(w, l);
+        }
         if let Some(state) = self.cases.last().copied() {
             match state {
                 Case::Header => {
                     if kw == Some("in") {
+                        self.finish();
+                        self.new_pipeline();
                         *self.cases.last_mut().unwrap() = Case::Pattern;
+                    } else {
+                        self.keep_code(w, l);
                     }
                     return;
                 }
                 Case::Pattern => {
                     if kw == Some("esac") {
+                        self.words.clear();
                         self.cases.pop();
+                    } else {
+                        self.keep_code(w, l);
                     }
                     return;
                 }
@@ -200,6 +239,8 @@ impl Parser {
                 Case::Header => return,
                 Case::Pattern => {
                     if op == ")" {
+                        self.finish();
+                        self.new_pipeline();
                         *self.cases.last_mut().unwrap() = Case::Body;
                     }
                     return;
@@ -214,9 +255,17 @@ impl Parser {
                 }
             }
         }
+        let closed_group = self.closed_group.take();
         match op {
             "|" | "|&" => {
                 self.finish();
+                if let Some(start) = closed_group {
+                    // `{ curl …; } | sh`: everything in the group feeds the pipe.
+                    let pipeline = self.pipeline;
+                    for c in &mut self.script.commands[start..] {
+                        c.pipeline = pipeline;
+                    }
+                }
                 self.stage += 1;
             }
             "(" => {
@@ -254,6 +303,17 @@ impl Parser {
             stage: self.stage,
         });
     }
+}
+
+/// True if expanding these parts runs code.
+fn runs_code(parts: &[Part]) -> bool {
+    parts.iter().any(|p| match p {
+        Part::Subst { .. } | Part::ProcSubst { .. } | Part::Arith(_) => true,
+        Part::Param {
+            fallback: Some(fb), ..
+        } => runs_code(fb),
+        _ => false,
+    })
 }
 
 #[cfg(test)]
