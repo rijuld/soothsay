@@ -1,8 +1,10 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
+use std::path::PathBuf;
 use std::process::{self, Stdio};
 
-use soothsay::{render, Category, Severity};
+use soothsay::guard::{self, Decision, Guard, KNOWN_SHELLS, MAX_SCRIPT as MAX_INPUT};
+use soothsay::{json, render, Category, Severity};
 
 const HELP: &str = "\
 soothsay: read the omens before you `curl | sh`
@@ -10,6 +12,8 @@ soothsay: read the omens before you `curl | sh`
 USAGE
     curl -fsSL https://example.com/install.sh | soothsay [OPTIONS]
     soothsay [OPTIONS] install.sh
+    soothsay --check-command '<shell command>'
+    soothsay hook                 (Claude Code PreToolUse hook; JSON on stdin)
 
     Reads a shell script and tells you what it will do to your machine before
     you run it: files written, shell profiles edited, sudo, startup items,
@@ -20,12 +24,21 @@ OPTIONS
         --json             Machine-readable report on stdout
         --run              After the report, ask on your terminal, then run the
                            *exact bytes* that were analyzed (never re-downloads)
-    -y, --yes              With --run: don't ask (policy flags still apply)
+    -y, --yes              With --run: don't ask (policy flags still apply, and a
+                           script with danger findings still isn't run)
+        --allow-danger     With --run --yes: run even if there are danger findings
         --shell <SH>       Interpreter for --run (default: the script's shebang, else sh)
+        --expect-sha256 <HEX>
+                           Exit 1 unless the script's sha256 is exactly this
+                           (pin the bytes you reviewed earlier)
         --deny <CATS>      Exit 1 if any finding is in these categories
                            (comma-separated ids, or \"all\")
         --fail-on <SEV>    Exit 1 if any finding is at least this severe
                            (notice | warn | danger)
+        --ignore-unreachable
+                           Let --deny / --fail-on skip findings in functions
+                           that look never-called (off by default: a script
+                           can hide how it calls them)
         --categories       List category ids and exit
         --no-color         Disable colour (also honours NO_COLOR)
     -h, --help             Show this help
@@ -34,10 +47,27 @@ OPTIONS
     Arguments after `--` are passed to the script by --run:
         curl -fsSL https://sh.rustup.rs | soothsay --run -- -y
 
+GUARDING AN AGENT
+    --check-command <CMD>  If CMD runs code from the network (`curl … | sh`,
+                           `bash <(curl …)`, or a file an earlier checked command
+                           downloaded), fetch that script, review it, save the
+                           exact bytes, and explain how to run them. Exit 0 if
+                           there's nothing to review, 1 if blocked, 3 if it runs
+                           reviewed bytes and the user should approve (review on
+                           stdout). Use - to read CMD from stdin.
+    hook                   The same check as a Claude Code PreToolUse hook: reads
+                           the hook JSON on stdin, exits 2 (block) with the
+                           review on stderr, asks the user (an \"ask\" decision) before
+                           a reviewed script runs, and blocks on any internal error.
+    Reviewed scripts go to $SOOTHSAY_CACHE, $XDG_CACHE_HOME/soothsay, or
+    ~/.cache/soothsay. Downloads use your `curl`.
+
 EXIT STATUS
     0  report printed (and, with --run, the script's own exit status)
     1  a --deny / --fail-on policy matched
-    2  usage or I/O error
+    1  --expect-sha256 did not match
+    2  usage or I/O error, or input that isn't a shell script
+       (empty, HTML, binary, or over 16 MiB)
 ";
 
 struct Args {
@@ -47,15 +77,22 @@ struct Args {
     run: bool,
     yes: bool,
     shell: Option<String>,
+    expect_sha256: Option<String>,
     deny: Vec<Category>,
     fail_on: Option<Severity>,
+    ignore_unreachable: bool,
+    allow_danger: bool,
     color: bool,
     script_args: Vec<String>,
 }
 
 fn die(msg: &str) -> ! {
+    die_with(2, msg)
+}
+
+fn die_with(code: i32, msg: &str) -> ! {
     eprintln!("soothsay: {msg}");
-    process::exit(2);
+    process::exit(code);
 }
 
 fn parse_args() -> Args {
@@ -66,8 +103,11 @@ fn parse_args() -> Args {
         run: false,
         yes: false,
         shell: None,
+        expect_sha256: None,
         deny: Vec::new(),
         fail_on: None,
+        ignore_unreachable: false,
+        allow_danger: false,
         color: std::env::var_os("NO_COLOR").is_none() && io::stdout().is_terminal(),
         script_args: Vec::new(),
     };
@@ -103,7 +143,16 @@ fn parse_args() -> Args {
             "--run" => a.run = true,
             "-y" | "--yes" => a.yes = true,
             "--no-color" => a.color = false,
+            "--ignore-unreachable" => a.ignore_unreachable = true,
+            "--allow-danger" => a.allow_danger = true,
             "--shell" => a.shell = Some(value("--shell")),
+            "--expect-sha256" => {
+                let v = value("--expect-sha256").to_ascii_lowercase();
+                if v.len() != 64 || !v.chars().all(|c| c.is_ascii_hexdigit()) {
+                    die("--expect-sha256 needs a full 64-character hex sha256");
+                }
+                a.expect_sha256 = Some(v);
+            }
             "--deny" => {
                 let v = value("--deny");
                 for id in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -140,6 +189,37 @@ fn parse_args() -> Args {
 }
 
 fn main() {
+    let mut argv = std::env::args().skip(1);
+    match argv.next().as_deref() {
+        Some("hook") => hook(),
+        Some("--check-command") => {
+            let cmd = match argv.next() {
+                Some(c) if c == "-" => {
+                    let mut s = String::new();
+                    io::stdin()
+                        .take(1024 * 1024)
+                        .read_to_string(&mut s)
+                        .unwrap_or_else(|e| die(&format!("reading stdin: {e}")));
+                    s
+                }
+                Some(c) => c,
+                None => die("--check-command needs a command (or - for stdin)"),
+            };
+            let cwd = std::env::current_dir().unwrap_or_else(|e| die(&format!("cwd: {e}")));
+            match check(&cmd, cwd, true) {
+                Decision::Pass => process::exit(0),
+                Decision::Block(msg) => {
+                    println!("{msg}");
+                    process::exit(1);
+                }
+                Decision::Ask(msg) => {
+                    println!("{msg}");
+                    process::exit(3);
+                }
+            }
+        }
+        _ => {}
+    }
     let args = parse_args();
 
     let (source, bytes) = match args.file.as_deref() {
@@ -148,19 +228,44 @@ fn main() {
                 eprint!("{HELP}");
                 process::exit(2);
             }
-            let mut buf = Vec::new();
-            io::stdin()
-                .read_to_end(&mut buf)
-                .unwrap_or_else(|e| die(&format!("reading stdin: {e}")));
+            let buf =
+                read_capped(io::stdin()).unwrap_or_else(|e| die(&format!("reading stdin: {e}")));
             ("stdin".to_string(), buf)
         }
         Some(path) => {
-            let buf = fs::read(path).unwrap_or_else(|e| die(&format!("{path}: {e}")));
+            let buf = File::open(path)
+                .and_then(read_capped)
+                .unwrap_or_else(|e| die(&format!("{path}: {e}")));
             (path.rsplit('/').next().unwrap_or(path).to_string(), buf)
         }
     };
-    let src = String::from_utf8_lossy(&bytes);
-    let report = soothsay::analyze(&src);
+    if bytes.len() as u64 > MAX_INPUT {
+        die("input is over 16 MiB; that's not an install script, refusing to read it");
+    }
+    if let Some(why) = guard::not_a_script(&bytes) {
+        die(why);
+    }
+    let report = soothsay::analyze_bytes(&bytes);
+    if let Some(want) = &args.expect_sha256 {
+        if *want != report.sha256 {
+            die_with(
+                1,
+                &format!(
+                    "sha256 mismatch: expected {want}, got {}; these are not the bytes you pinned",
+                    report.sha256
+                ),
+            );
+        }
+    }
+
+    let shell_script = KNOWN_SHELLS.contains(&report.interpreter.as_str());
+    if !shell_script {
+        eprintln!(
+            "soothsay: WARNING: this is a {} script (per its #! line). soothsay only reads \
+             shell, so the report below says nothing about what it will do.",
+            report.interpreter
+        );
+    }
 
     if args.json {
         print!("{}", render::json(&report, &source));
@@ -182,7 +287,7 @@ fn main() {
     let denied: Vec<_> = report
         .findings
         .iter()
-        .filter(|f| f.reachable)
+        .filter(|f| f.reachable || !args.ignore_unreachable)
         .filter(|f| {
             args.deny.contains(&f.category) || args.fail_on.is_some_and(|s| f.severity >= s)
         })
@@ -200,14 +305,28 @@ fn main() {
     }
 
     if args.run {
-        let shell = args.shell.clone().unwrap_or_else(|| {
-            let i = report.interpreter.as_str();
-            if matches!(i, "sh" | "bash" | "zsh" | "dash" | "ksh") {
-                i.to_string()
-            } else {
-                "sh".into()
-            }
-        });
+        let danger = report
+            .findings
+            .iter()
+            .any(|f| f.severity == Severity::Danger);
+        if danger && args.yes && !args.allow_danger {
+            eprintln!(
+                "soothsay: not running a script with danger findings unattended; \
+                 drop --yes to decide yourself, or pass --allow-danger"
+            );
+            process::exit(1);
+        }
+        if !shell_script && args.shell.is_none() {
+            eprintln!(
+                "soothsay: not running a {} script as shell; pass --shell <interpreter> if you really mean to",
+                report.interpreter
+            );
+            process::exit(2);
+        }
+        let shell = args
+            .shell
+            .clone()
+            .unwrap_or_else(|| report.interpreter.clone());
         process::exit(run(&bytes, &report.sha256, &shell, &args));
     }
 }
@@ -265,10 +384,157 @@ fn run(bytes: &[u8], sha: &str, shell: &str, args: &Args) -> i32 {
         .status();
     let _ = fs::remove_file(&path);
     match status {
-        Ok(s) => s.code().unwrap_or(1),
+        Ok(s) => exit_code(s),
         Err(e) => {
             eprintln!("soothsay: running {shell}: {e}");
             2
+        }
+    }
+}
+
+/// Read at most one byte past [`MAX_INPUT`], so oversize input is detected
+/// without buffering all of it.
+fn read_capped(r: impl Read) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    r.take(MAX_INPUT + 1).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// The script's exit status, or 128+N if signal N killed it, as shells report it.
+fn exit_code(s: process::ExitStatus) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = s.signal() {
+            return 128 + sig;
+        }
+    }
+    s.code().unwrap_or(1)
+}
+
+fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+}
+
+fn check(command: &str, cwd: PathBuf, can_ask: bool) -> Decision {
+    let home = home();
+    let Some(cache) = guard::default_cache(home.as_deref()) else {
+        return Decision::Block(
+            "soothsay: no cache directory (set SOOTHSAY_CACHE or HOME); blocking to be safe".into(),
+        );
+    };
+    let g = Guard {
+        cwd,
+        home,
+        cache,
+        fetch: &fetch,
+        can_ask,
+    };
+    g.check(command)
+}
+
+/// Download a script with the user's `curl`, the same client a `curl | sh`
+/// would have used, so a server that cloaks by user agent serves us the same
+/// bytes.
+fn fetch(url: &str) -> Result<Vec<u8>, String> {
+    let mut child = process::Command::new("curl")
+        .args([
+            "-fsSL",
+            "--proto",
+            "=https,http",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "30",
+            "--max-filesize",
+            "16777216",
+            "--",
+            url,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("running curl: {e}"))?;
+    let mut body = Vec::new();
+    if let Some(out) = child.stdout.take() {
+        out.take(MAX_INPUT + 1)
+            .read_to_end(&mut body)
+            .map_err(|e| format!("reading curl output: {e}"))?;
+    }
+    let mut err = String::new();
+    if let Some(e) = child.stderr.take() {
+        let _ = e.take(4096).read_to_string(&mut err);
+    }
+    let status = child.wait().map_err(|e| format!("waiting for curl: {e}"))?;
+    if !status.success() {
+        let why = err.lines().next().unwrap_or("").trim();
+        return Err(format!(
+            "curl exited with {}{}{why}",
+            exit_code(status),
+            if why.is_empty() { "" } else { ": " }
+        ));
+    }
+    Ok(body)
+}
+
+/// `soothsay hook`: a Claude Code PreToolUse hook. Exit 0 lets the command
+/// through; exit 2 blocks it and hands stderr to Claude. Every failure,
+/// including a panic, blocks: any other exit code would let the command run.
+fn hook() -> ! {
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("soothsay hook crashed ({info}); blocking this command to be safe.");
+        process::exit(2);
+    }));
+    let block = |msg: &str| -> ! {
+        eprintln!("{msg}");
+        process::exit(2);
+    };
+    let mut input = String::new();
+    if let Err(e) = io::stdin().take(4 * 1024 * 1024).read_to_string(&mut input) {
+        block(&format!(
+            "soothsay hook: reading input: {e}; blocking to be safe"
+        ));
+    }
+    let v = json::parse(&input).unwrap_or_else(|e| {
+        block(&format!(
+            "soothsay hook: input isn't valid JSON ({e}); blocking to be safe"
+        ))
+    });
+    if v.get("tool_name").and_then(json::Value::as_str) != Some("Bash") {
+        process::exit(0);
+    }
+    let Some(command) = v
+        .get("tool_input")
+        .and_then(|t| t.get("command"))
+        .and_then(json::Value::as_str)
+    else {
+        block("soothsay hook: Bash call without a command string; blocking to be safe");
+    };
+    let cwd = v
+        .get("cwd")
+        .and_then(json::Value::as_str)
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| block("soothsay hook: no working directory; blocking to be safe"));
+    // Only modes that really stop and prompt the user can carry an "ask";
+    // anywhere else (or if the mode is unknown) a run of reviewed bytes blocks.
+    let can_ask = matches!(
+        v.get("permission_mode").and_then(json::Value::as_str),
+        Some("default" | "acceptEdits" | "plan")
+    );
+    match check(command, cwd, can_ask) {
+        Decision::Pass => process::exit(0),
+        Decision::Block(msg) => block(&msg),
+        Decision::Ask(msg) => {
+            println!(
+                "{{\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\",\
+                 \"permissionDecision\":\"ask\",\"permissionDecisionReason\":{}}}}}",
+                render::json_str(&msg)
+            );
+            process::exit(0);
         }
     }
 }

@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::lexer::{is_name, Part, Word};
+use crate::lexer::{is_name, Part, Token, Word};
 use crate::parse::{parse, Command, Script};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -160,7 +160,7 @@ pub struct Finding {
     pub as_root: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Touch {
     Write,
     Append,
@@ -219,6 +219,11 @@ pub struct Report {
     pub urls: Vec<Url>,
     /// Functions defined, and whether anything calls them.
     pub functions: Vec<(String, bool)>,
+    /// Files the script saves from the network: (path, url, line).
+    pub downloads: Vec<(String, String, usize)>,
+    /// Local files the script runs as code (`sh x.sh`, `. ./env`, `./tool`),
+    /// with the line. Used to follow a download into a later command.
+    pub executed: Vec<(String, usize)>,
 }
 
 impl Report {
@@ -262,7 +267,8 @@ pub fn analyze(src: &str) -> Report {
     }
     a.run(&script);
 
-    // Which functions can actually run? Start from top-level calls and follow.
+    // Which functions can actually run? Start from top-level calls and the
+    // shell's own hooks, and follow.
     let defined: HashSet<&str> = a.defined.iter().map(|(n, _)| n.as_str()).collect();
     let mut live: HashSet<String> = HashSet::new();
     let mut frontier: Vec<String> = a
@@ -270,6 +276,12 @@ pub fn analyze(src: &str) -> Report {
         .iter()
         .filter(|(from, to)| from.is_none() && defined.contains(to.as_str()))
         .map(|(_, to)| to.clone())
+        .chain(
+            defined
+                .iter()
+                .filter(|n| is_shell_hook(n))
+                .map(|n| n.to_string()),
+        )
         .collect();
     while let Some(f) = frontier.pop() {
         if live.insert(f.clone()) {
@@ -283,6 +295,17 @@ pub fn analyze(src: &str) -> Report {
             }
         }
     }
+    // A command name soothsay can't resolve (`"$@"`, `${1:-main}`, a decoded
+    // string) could call any function, so none of them can be ruled out.
+    let dynamic = a.calls.iter().any(|(from, to)| {
+        to == DYNAMIC_CALL
+            && from
+                .as_deref()
+                .map_or(true, |f| live.contains(f) || !defined.contains(f))
+    });
+    if dynamic {
+        live.extend(defined.iter().map(|n| n.to_string()));
+    }
     let reachable = |function: &Option<String>| match function {
         None => true,
         Some(name) => live.contains(name) || !defined.contains(name.as_str()),
@@ -293,6 +316,11 @@ pub fn analyze(src: &str) -> Report {
     for f in &mut a.files {
         f.reachable = reachable(&f.function);
     }
+    for u in &mut a.urls {
+        if a.ran_urls.contains(&u.url) {
+            u.action = "run";
+        }
+    }
 
     let mut seen = HashSet::new();
     let functions = a
@@ -302,6 +330,8 @@ pub fn analyze(src: &str) -> Report {
         .map(|(n, _)| (n.clone(), live.contains(n)))
         .collect();
 
+    let mut downloads: Vec<_> = a.downloads.into_values().collect();
+    downloads.sort_by(|x, y| (x.2, &x.0).cmp(&(y.2, &y.0)));
     Report {
         lines: src.lines().count(),
         sha256: crate::sha256::hex(src.as_bytes()),
@@ -310,6 +340,117 @@ pub fn analyze(src: &str) -> Report {
         files: a.files,
         urls: a.urls,
         functions,
+        downloads,
+        executed: a.executed,
+    }
+}
+
+/// Recorded in `calls` for a command whose name can't be known statically.
+const DYNAMIC_CALL: &str = "\0dynamic";
+
+/// Functions the shell itself calls: bash/zsh hooks and zsh's `TRAPINT` & co.
+fn is_shell_hook(name: &str) -> bool {
+    matches!(
+        name,
+        "command_not_found_handle"
+            | "command_not_found_handler"
+            | "precmd"
+            | "preexec"
+            | "chpwd"
+            | "periodic"
+            | "zshexit"
+            | "zshaddhistory"
+    ) || name.strip_prefix("TRAP").is_some_and(|sig| {
+        !sig.is_empty()
+            && sig
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    })
+}
+
+/// True if `s`, a resolved word, still names something unknown (`${x}`,
+/// `$(…)`) and nothing outside those placeholders makes it a path.
+fn unknown_name(s: &str) -> bool {
+    if !s.contains("${") && !s.contains("$(") {
+        return false;
+    }
+    let mut rest = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '$' && matches!(chars.peek(), Some('{') | Some('(')) {
+            let (open, close) = if chars.next() == Some('{') {
+                ('{', '}')
+            } else {
+                ('(', ')')
+            };
+            let mut depth = 1;
+            for n in chars.by_ref() {
+                if n == open {
+                    depth += 1;
+                } else if n == close {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+        } else {
+            rest.push(c);
+        }
+    }
+    !rest.contains('/')
+}
+
+impl Analyzer {
+    /// Functions a command might call besides `h.name`, or `None` if its
+    /// name is built at runtime and could be anything.
+    fn call_targets(&self, h: &Head, function: &Option<String>) -> Option<Vec<String>> {
+        match h.name.as_str() {
+            "eval" if h.words[1..].iter().any(|w| w.literal().is_none()) => return None,
+            "trap"
+                if h.words
+                    .get(1)
+                    .is_some_and(|w| unknown_name(&self.resolve(w))) =>
+            {
+                return None
+            }
+            _ => {}
+        }
+        let first = h.words.first()?;
+        // An unquoted `$f` holding `$(…)` arrives here already split into words.
+        if let Some(l) = first.literal() {
+            return if unknown_name(&l) {
+                None
+            } else {
+                Some(Vec::new())
+            };
+        }
+        if let [Part::Param { name, fallback }] = first.parts.as_slice() {
+            let positional = name == "@" || name == "*" || name.chars().all(|c| c.is_ascii_digit());
+            if positional {
+                // `ensure() { "$@" || exit 1; }`: each call site names the command.
+                if function.is_some() && (name == "@" || name == "*") && fallback.is_none() {
+                    return Some(Vec::new());
+                }
+                return None;
+            }
+            if let Some(vals) = self.ever.get(name) {
+                let mut names = Vec::new();
+                for v in vals {
+                    if unknown_name(v) {
+                        return None;
+                    }
+                    if let Some(n) = v.split_whitespace().next() {
+                        names.push(basename(n).to_string());
+                    }
+                }
+                return Some(names);
+            }
+        }
+        if unknown_name(&h.args[0]) {
+            return None;
+        }
+        Some(Vec::new())
     }
 }
 
@@ -493,6 +634,19 @@ struct Analyzer {
     sudo_wrappers: HashSet<String>,
     arrays: HashMap<String, Vec<String>>,
     depth: usize,
+    /// Dedup indexes into `findings` / `files`, so big scripts stay linear.
+    /// An entry is only trusted if the index still holds a matching item,
+    /// since `findings` can be truncated.
+    finding_index: HashMap<(Category, usize, String), usize>,
+    file_index: HashSet<(String, Touch)>,
+    /// Files fetched from the network, keyed by [`download_key`]: (path, url, line).
+    downloads: HashMap<String, (String, String, usize)>,
+    /// URLs whose downloaded file is later run; marked "run" once analysis ends.
+    ran_urls: HashSet<String>,
+    /// Local files run as code: (path, line).
+    executed: Vec<(String, usize)>,
+    /// Text of the most recent literal `echo`/`printf`, for `( …; echo x ) | crontab -`.
+    last_echo: Option<String>,
 }
 
 struct Ctx<'a> {
@@ -537,11 +691,15 @@ impl Analyzer {
         message: String,
         detail: Option<String>,
     ) {
-        let dup = self
-            .findings
-            .iter()
-            .any(|f| f.category == cat && f.line == ctx.line && f.message == message);
+        let key = (cat, ctx.line, message);
+        let dup = self.finding_index.get(&key).is_some_and(|&i| {
+            self.findings
+                .get(i)
+                .is_some_and(|f| f.category == key.0 && f.line == key.1 && f.message == key.2)
+        });
         if !dup {
+            let (_, _, message) = key.clone();
+            self.finding_index.insert(key, self.findings.len());
             self.findings.push(Finding {
                 category: cat,
                 severity: sev,
@@ -758,6 +916,10 @@ impl Analyzer {
                         }
                     }
                 }
+                // `busybox wget …`, `busybox sh`: the applet is the real command.
+                "busybox" if h.args.get(1).is_some_and(|a| !a.starts_with('-')) => {
+                    take(&mut h, 1);
+                }
                 w if self.sudo_wrappers.contains(w) => {
                     h.as_root = true;
                     take(&mut h, 1);
@@ -805,6 +967,13 @@ impl Analyzer {
         }
         for r in &cmd.redirects {
             self.substitutions(&r.target, cmd);
+            // An unquoted heredoc (`<<EOF`, not `<<'EOF'`) runs its `$(…)` while
+            // the body is being written.
+            if let (Some(body), false) = (&r.body, r.target.quoted) {
+                if body.contains("$(") || body.contains('`') {
+                    self.substitutions_in_text(body, cmd.offset + r.body_line, &cmd.function);
+                }
+            }
         }
 
         let only_assignments = cmd.words.iter().all(|w| assignment(w).is_some());
@@ -824,14 +993,40 @@ impl Analyzer {
         }
 
         let Some(h) = self.head(&cmd.words) else {
+            // A bare `exec 3<>/dev/tcp/…` or `exec >> ~/.zshrc` has no command
+            // left after `exec`, but its redirects still happen.
+            self.redirects(cmd, None, group, idx);
             return;
         };
         self.calls.push((cmd.function.clone(), h.name.clone()));
+        match self.call_targets(&h, &cmd.function) {
+            Some(names) => {
+                for n in names {
+                    self.calls.push((cmd.function.clone(), n));
+                }
+            }
+            None => self
+                .calls
+                .push((cmd.function.clone(), DYNAMIC_CALL.to_string())),
+        }
         let ctx = Ctx {
             line: cmd.line,
             function: &cmd.function,
             as_root: h.as_root,
         };
+
+        // `LD_PRELOAD=/tmp/x.so ls`: prefix assignments only affect this command,
+        // but some of them hijack it.
+        for w in cmd.words.iter().take_while(|w| assignment(w).is_some()) {
+            if let Some((name, value)) = assignment(w) {
+                let v = self.resolve(&value);
+                self.env_hijack(&name, &v, &ctx);
+            }
+        }
+        self.ran_download(&h, &ctx);
+        if matches!(h.name.as_str(), "echo" | "printf") {
+            self.last_echo = echo_code(&h);
+        }
 
         if h.as_root {
             self.add(
@@ -885,6 +1080,11 @@ impl Analyzer {
                     };
                     self.substitutions(&inner, cmd);
                 }
+                // `$(( $(curl …|sh) ))`: the shell runs substitutions inside
+                // arithmetic before evaluating it.
+                Part::Arith(e) if e.contains("$(") || e.contains('`') => {
+                    self.substitutions_in_text(e, cmd.line, &cmd.function);
+                }
                 _ => {}
             }
         }
@@ -918,6 +1118,7 @@ impl Analyzer {
                 None,
             );
         }
+        self.env_hijack(name, &v, ctx);
         let seen = self.ever.entry(name.to_string()).or_default();
         if !seen.contains(&v) {
             seen.push(v.clone());
@@ -972,9 +1173,19 @@ impl Analyzer {
                         let msg = format!("{verb} one of {}", paths.join(", "));
                         self.add(Category::ShellProfile, sev, &ctx, msg, content);
                     } else {
-                        for path in paths {
-                            self.write(&path, how, &ctx, content.clone());
+                        for path in &paths {
+                            self.write(path, how, &ctx, content.clone());
                         }
+                    }
+                    if let Some(when) = paths.iter().find_map(|p| runs_later(classify(p))) {
+                        if let Some(code) = self.raw_content(cmd, h, group, idx) {
+                            self.planted(&code, &paths.join(", "), when, &ctx);
+                        }
+                    }
+                }
+                "<>" => {
+                    for path in self.alternatives(&r.target) {
+                        self.write(&path, Touch::Modify, &ctx, None);
                     }
                 }
                 "<" => {
@@ -1060,6 +1271,68 @@ impl Analyzer {
         None
     }
 
+    /// Full text being written, unlike [`Self::content`], which is a one-line snippet.
+    fn raw_content(
+        &self,
+        cmd: &Command,
+        h: Option<&Head>,
+        group: &[Command],
+        idx: usize,
+    ) -> Option<String> {
+        if let Some(b) = cmd.redirects.iter().find_map(|r| r.body.clone()) {
+            return Some(b);
+        }
+        if let Some(t) = h.and_then(echo_code) {
+            return Some(t);
+        }
+        if idx > 0 {
+            return self.head(&group[idx - 1].words).and_then(|p| echo_code(&p));
+        }
+        None
+    }
+
+    /// Code written into a file that runs later (a shell profile, a cron job, a
+    /// launch agent). Analyze it as shell code and, if it does something risky,
+    /// report that it's being planted. The analysis runs in a scratch analyzer so
+    /// the planted code's own effects aren't reported as happening now.
+    fn planted(&mut self, code: &str, target: &str, when: &str, ctx: &Ctx) {
+        if code.trim().is_empty() {
+            return;
+        }
+        let mut sub = Analyzer {
+            vars: self.vars.clone(),
+            ever: self.ever.clone(),
+            arrays: self.arrays.clone(),
+            wrappers: self.wrappers.clone(),
+            sudo_wrappers: self.sudo_wrappers.clone(),
+            defined: self.defined.clone(),
+            depth: self.depth,
+            ..Analyzer::default()
+        };
+        sub.nested(code, ctx.line, ctx.function);
+        let escalates = |c: Category| {
+            matches!(
+                c,
+                Category::RemoteExec | Category::Obfuscation | Category::Secrets
+            )
+        };
+        let Some(worst) = sub
+            .findings
+            .iter()
+            .filter(|f| f.severity >= Severity::Warn)
+            .max_by_key(|f| (escalates(f.category), f.severity))
+        else {
+            return;
+        };
+        let sev = if escalates(worst.category) || worst.severity == Severity::Danger {
+            Severity::Danger
+        } else {
+            Severity::Warn
+        };
+        let msg = format!("plants code in {target} that {when}: it {}", worst.message);
+        self.add(Category::Persistence, sev, ctx, msg, Some(snippet(code)));
+    }
+
     fn write(&mut self, raw: &str, how: Touch, ctx: &Ctx, content: Option<String>) {
         let path = tidy_path(raw);
         if path.is_empty() || path.starts_with('&') {
@@ -1081,7 +1354,7 @@ impl Analyzer {
             }
             return;
         }
-        if !self.files.iter().any(|f| f.path == path && f.how == how) {
+        if self.file_index.insert((path.clone(), how)) {
             self.files.push(FileTouch {
                 path: path.clone(),
                 how,
@@ -1312,8 +1585,8 @@ impl Analyzer {
             .collect();
 
         match n {
-            _ if DOWNLOADERS.contains(&n) => self.downloader(h, &later, ctx),
-            _ if INTERPRETERS.contains(&n) => self.interpreter(h, cmd, idx, ctx),
+            _ if DOWNLOADERS.contains(&n) => self.downloader(h, cmd, &later, ctx),
+            _ if INTERPRETERS.contains(&n) => self.interpreter(h, cmd, group, idx, ctx),
             "eval" => {
                 let mut remote = false;
                 for w in &h.words[1..] {
@@ -1416,8 +1689,23 @@ impl Analyzer {
                     Touch::Write
                 };
                 let content = self.content(cmd, Some(h), group, idx);
-                for p in h.positional(&[]) {
-                    self.write(&p, how, ctx, content.clone());
+                let paths = h.positional(&[]);
+                for p in &paths {
+                    self.write(p, how, ctx, content.clone());
+                }
+                if let Some(when) = paths.iter().find_map(|p| runs_later(classify(p))) {
+                    if let Some(code) = self.raw_content(cmd, Some(h), group, idx) {
+                        self.planted(&code, &paths.join(", "), when, ctx);
+                    }
+                }
+            }
+            "alias" => {
+                // `alias ls='curl … | sh'`: the body runs wherever the alias is used.
+                for w in &h.words[1..] {
+                    if let Some((_, value)) = assignment(w) {
+                        let body = self.resolve(&value);
+                        self.nested(&body, ctx.line, ctx.function);
+                    }
                 }
             }
             "sed" | "gsed"
@@ -1563,6 +1851,17 @@ impl Analyzer {
                         "installs a crontab (runs on a schedule)".into(),
                         content,
                     );
+                    // `(crontab -l; echo "* * * * * cmd") | crontab -`: the echo sits
+                    // in a group in front of the pipe.
+                    let table = self.raw_content(cmd, Some(h), group, idx).or_else(|| {
+                        (idx == 0 && cmd.stage > 0)
+                            .then(|| self.last_echo.clone())
+                            .flatten()
+                    });
+                    if let Some(table) = table {
+                        let jobs = cron_commands(&table);
+                        self.planted(&jobs, "your crontab", "runs on a schedule", ctx);
+                    }
                 }
             }
             "launchctl" => {
@@ -1840,7 +2139,7 @@ impl Analyzer {
         }
     }
 
-    fn downloader(&mut self, h: &Head, later: &[Head], ctx: &Ctx) {
+    fn downloader(&mut self, h: &Head, cmd: &Command, later: &[Head], ctx: &Ctx) {
         let urls = self.urls_of(h);
         let insecure = h.has("--insecure")
             || h.has("--no-check-certificate")
@@ -1923,11 +2222,30 @@ impl Analyzer {
                 });
             }
         }
-        if let Some(out) = h
-            .value(&["-o", "--output", "-O", "--output-document"])
-            .filter(|o| o != "-")
-        {
+        // curl's `-O` takes no value (it names the file after the URL), wget's does.
+        let out_flags: &[&str] = if h.name == "curl" {
+            &["-o", "--output"]
+        } else {
+            &["-o", "--output", "-O", "--output-document"]
+        };
+        let mut outputs = Vec::new();
+        if let Some(out) = h.value(out_flags).filter(|o| o != "-") {
             self.write(&out, Touch::Download, ctx, None);
+            outputs.push(out);
+        }
+        // `curl -s url > /tmp/x.sh` (redirects() records the write itself).
+        for r in &cmd.redirects {
+            if matches!(r.op.as_str(), ">" | ">|" | ">>") && matches!(r.fd, None | Some(1)) {
+                outputs.push(self.resolve(&r.target));
+            }
+        }
+        let url = urls
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "<unknown url>".into());
+        for out in outputs {
+            self.downloads
+                .insert(download_key(&out), (tidy_path(&out), url.clone(), ctx.line));
         }
 
         // `curl … | sh`, `curl … | sudo bash -s -- --flag`
@@ -1965,13 +2283,16 @@ impl Analyzer {
         }
     }
 
-    fn interpreter(&mut self, h: &Head, cmd: &Command, idx: usize, ctx: &Ctx) {
+    fn interpreter(&mut self, h: &Head, cmd: &Command, group: &[Command], idx: usize, ctx: &Ctx) {
         let n = h.name.as_str();
         let mut remote = false;
         for w in &h.words[1..] {
             remote |= self.remote_in_word(w, n, ctx);
         }
         if remote {
+            return;
+        }
+        if (idx > 0 || cmd.stage > 0) && self.piped_code(h, cmd, group, idx, ctx) {
             return;
         }
         if n == "osascript" {
@@ -2056,6 +2377,201 @@ impl Analyzer {
             }
             _ => {}
         }
+    }
+
+    /// Run the `$(…)` and backtick substitutions in a piece of text, such as an
+    /// arithmetic expression or an unquoted heredoc body, starting on `first_line`.
+    fn substitutions_in_text(&mut self, text: &str, first_line: usize, function: &Option<String>) {
+        for t in crate::lexer::tokenize(text) {
+            let w = match t {
+                Token::Word(w, _) => w,
+                Token::Redir(r, _) => r.target,
+                Token::Op(..) => continue,
+            };
+            for p in &w.parts {
+                if let Part::Subst { script, line } | Part::ProcSubst { script, line } = p {
+                    self.nested(script, first_line + line.saturating_sub(1), function);
+                }
+            }
+        }
+    }
+
+    /// `BASH_ENV=…`, `LD_PRELOAD=…`: variables that make other programs run code.
+    fn env_hijack(&mut self, name: &str, v: &str, ctx: &Ctx) {
+        let file_like = v.contains('/') || v.contains('.');
+        let msg = match name {
+            "BASH_ENV" if file_like => {
+                format!("sets BASH_ENV={v}: every later bash script runs that file first")
+            }
+            "ENV" if file_like => {
+                format!("sets ENV={v}: every later sh/interactive shell runs that file first")
+            }
+            "PROMPT_COMMAND" if !v.is_empty() => format!(
+                "sets PROMPT_COMMAND: runs `{}` before every prompt",
+                shorten(v, 60)
+            ),
+            "LD_PRELOAD" | "DYLD_INSERT_LIBRARIES" if !v.is_empty() => {
+                format!("sets {name}={v}: injects that library into every program it starts")
+            }
+            _ => return,
+        };
+        self.add(Category::Security, Severity::Warn, ctx, msg, None);
+    }
+
+    /// `sh /tmp/x.sh`, `. "$tmp"`, `"$tmp/tool"` where that file was downloaded
+    /// earlier in the script.
+    fn ran_download(&mut self, h: &Head, ctx: &Ctx) {
+        let n = h.name.as_str();
+        let ran = if matches!(n, "." | "source") {
+            h.args.get(1).cloned()
+        } else if INTERPRETERS.contains(&n) && !h.has("-c") {
+            h.positional(&["-o", "-O", "-W", "-X", "-m"])
+                .into_iter()
+                .find(|p| p != "-")
+        } else {
+            h.args.first().filter(|a| a.contains('/')).cloned()
+        };
+        if let Some(path) = ran.filter(|p| !p.is_empty() && !is_system_path(p)) {
+            self.executed.push((path, ctx.line));
+        }
+        if self.downloads.is_empty() {
+            return;
+        }
+        let find = |p: &str| self.downloads.get(&download_key(p)).cloned();
+        let (hit, interpreted) = match h.args.first().and_then(|a| find(a)) {
+            Some(d) => (Some(d), false),
+            None if matches!(n, "." | "source") => (h.args.get(1).and_then(|a| find(a)), true),
+            None if INTERPRETERS.contains(&n) => (
+                h.positional(&["-o", "-O", "-W", "-X", "-m"])
+                    .into_iter()
+                    .find(|p| p != "-")
+                    .and_then(|p| find(&p)),
+                true,
+            ),
+            None => (None, false),
+        };
+        let Some((path, url, line)) = hit else {
+            return;
+        };
+        self.ran_urls.insert(url.clone());
+        let script = interpreted
+            || [".sh", ".bash", ".zsh", ".py", ".pl", ".rb"]
+                .iter()
+                .any(|e| path.ends_with(e) || url.ends_with(e));
+        if script {
+            let msg = format!("runs {path}, which it downloaded from {url} on line {line}");
+            self.add(
+                Category::RemoteExec,
+                Severity::Warn,
+                ctx,
+                msg,
+                Some(h.line()),
+            );
+        } else {
+            let msg = format!("runs {path}, a program it downloaded from {url} on line {line}");
+            self.add(
+                Category::RemoteExec,
+                Severity::Notice,
+                ctx,
+                msg,
+                Some(h.line()),
+            );
+        }
+    }
+
+    /// `… | sh`: a shell or interpreter reading its program from a pipe. Returns
+    /// true if that's reported, here or by a sharper rule elsewhere.
+    fn piped_code(
+        &mut self,
+        h: &Head,
+        cmd: &Command,
+        group: &[Command],
+        idx: usize,
+        ctx: &Ctx,
+    ) -> bool {
+        let reads_stdin = h.positional(&["-c"]).iter().all(|p| p == "-") || h.has("-s");
+        if !reads_stdin || h.has("-c") || h.has("-e") {
+            return false;
+        }
+        let n = h.name.as_str();
+        let upstream: Vec<(&Command, Option<Head>)> = group[..idx]
+            .iter()
+            .map(|c| (c, self.head(&c.words)))
+            .collect();
+        // Downloads and decoders piped into a shell have sharper findings of their own.
+        if upstream.iter().any(|(_, u)| {
+            u.as_ref()
+                .is_some_and(|u| DOWNLOADERS.contains(&u.name.as_str()) || is_decoder(u))
+        }) {
+            return true;
+        }
+        // `echo 'code' | sh`, `cat <<EOF | sh`: the code is right here, so read it.
+        if let ([(src, Some(u))], true) = (upstream.as_slice(), cmd.stage == idx) {
+            let literal = if u.name == "cat" && u.positional(&[]).is_empty() {
+                src.redirects
+                    .iter()
+                    .find(|r| r.body.is_some() || r.op == "<<<")
+                    .map(|r| match &r.body {
+                        Some(b) => (b.clone(), src.offset + r.body_line),
+                        None => (self.resolve(&r.target), src.line),
+                    })
+            } else if u.words.iter().all(|w| w.literal().is_some()) {
+                echo_code(u).map(|c| (c, src.line))
+            } else {
+                None
+            };
+            if let Some((code, line)) = literal {
+                if SHELLS.contains(&n) {
+                    self.nested(&code, line, ctx.function);
+                    return true;
+                }
+                return false; // other languages: "feeds code to python3 on stdin"
+            }
+        }
+        let root = if h.as_root { " as root" } else { "" };
+        let network = upstream.iter().find_map(|(c, u)| {
+            let tcp = c.redirects.iter().any(|r| {
+                let t = self.resolve(&r.target);
+                t.contains("/dev/tcp/") || t.contains("/dev/udp/")
+            });
+            let tool = u.as_ref().is_some_and(|u| {
+                matches!(
+                    u.name.as_str(),
+                    "nc" | "ncat" | "netcat" | "socat" | "telnet"
+                ) || (u.name == "openssl" && u.has("s_client"))
+            });
+            (tcp || tool).then(|| u.as_ref().map(Head::line).unwrap_or_default())
+        });
+        if let Some(src) = network {
+            self.add(
+                Category::RemoteExec,
+                Severity::Warn,
+                ctx,
+                format!("pipes a raw network connection straight into {n}{root}"),
+                Some(src),
+            );
+            return true;
+        }
+        let what = if upstream.is_empty() {
+            "a command group".to_string()
+        } else {
+            let lines: Vec<String> = upstream
+                .iter()
+                .map(|(c, u)| match u {
+                    Some(u) => u.line(),
+                    None => format!("line {}", c.line),
+                })
+                .collect();
+            format!("`{}`", shorten(&lines.join(" | "), 60))
+        };
+        self.add(
+            Category::BlindSpot,
+            Severity::Warn,
+            ctx,
+            format!("pipes the output of {what} into {n}{root}: soothsay can't see what it runs"),
+            None,
+        );
+        true
     }
 
     fn remove(&mut self, h: &Head, ctx: &Ctx) {
@@ -2255,6 +2771,61 @@ impl Analyzer {
     }
 }
 
+/// The text an `echo`/`printf` prints, as best we can tell.
+fn echo_code(h: &Head) -> Option<String> {
+    if !matches!(h.name.as_str(), "echo" | "printf") {
+        return None;
+    }
+    let mut args: Vec<&str> = h
+        .args
+        .iter()
+        .skip(1)
+        .map(String::as_str)
+        .skip_while(|a| matches!(*a, "-e" | "-n" | "-en" | "-ne" | "-E"))
+        .collect();
+    // `printf '%s\n' "code"`: the arguments are the text, not the format.
+    if h.name == "printf" && args.len() > 1 && args[0].contains('%') {
+        args.remove(0);
+    }
+    let text = args.join(" ").replace("\\n", "\n");
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// When code written to a file of this kind will run, if it ever does.
+fn runs_later(kind: PathKind) -> Option<&'static str> {
+    match kind {
+        PathKind::ShellProfile | PathKind::ProbableProfile => Some("runs in every new shell"),
+        PathKind::Persistence => Some("runs at login or on a schedule"),
+        _ => None,
+    }
+}
+
+/// A crontab's commands, without their schedule fields.
+fn cron_commands(table: &str) -> String {
+    table
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            if assignment_text(l) {
+                return Some(l.to_string()); // `PATH=…` sets a variable for the jobs
+            }
+            let fields = if l.starts_with('@') { 1 } else { 5 };
+            let mut rest = l;
+            for _ in 0..fields {
+                rest = rest.trim_start();
+                rest = &rest[rest.find(char::is_whitespace)?..];
+            }
+            Some(rest.trim().to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn assignment_text(l: &str) -> bool {
+    l.split_once('=').is_some_and(|(n, _)| is_name(n))
+}
+
 fn is_decoder(h: &Head) -> bool {
     match h.name.as_str() {
         "base64" | "base32" => h.has("-d") || h.has("-D") || h.has("--decode"),
@@ -2449,6 +3020,11 @@ fn assignment(w: &Word) -> Option<(String, Word)> {
 
 fn basename(p: &str) -> &str {
     p.trim_end_matches('/').rsplit('/').next().unwrap_or(p)
+}
+
+/// Lookup key for a downloaded file, so `./x.sh` and `x.sh` match.
+fn download_key(p: &str) -> String {
+    tidy_path(p.strip_prefix("./").unwrap_or(p))
 }
 
 fn tidy_path(s: &str) -> String {

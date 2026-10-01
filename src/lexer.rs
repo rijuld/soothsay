@@ -76,8 +76,12 @@ pub enum Token {
 
 /// Split a script into words, operators and redirections.
 pub fn tokenize(src: &str) -> Vec<Token> {
-    Lexer::new(src, 1).run()
+    Lexer::new(src, 1, 0).run()
 }
+
+/// How deeply `${a:-${b:-…}}` fallbacks are parsed. Deeper ones keep their
+/// raw text, so hostile input can't overflow the stack.
+const MAX_PARAM_DEPTH: usize = 64;
 
 const OPERATORS: [&str; 11] = [";;&", ";;", ";&", "&&", "||", "|&", ";", "&", "|", "(", ")"];
 const REDIRECTS: [&str; 12] = [
@@ -93,10 +97,12 @@ struct Lexer {
     pending: Vec<(usize, String, bool)>,
     /// Inside `[[ ... ]]`, where `<` and `>` are comparisons, not redirects.
     dbracket: bool,
+    /// How many `${…:-…}` fallbacks this lexer is nested inside.
+    depth: usize,
 }
 
 impl Lexer {
-    fn new(src: &str, line: usize) -> Self {
+    fn new(src: &str, line: usize, depth: usize) -> Self {
         Lexer {
             s: src.chars().collect(),
             i: 0,
@@ -104,6 +110,7 @@ impl Lexer {
             toks: Vec::new(),
             pending: Vec::new(),
             dbracket: false,
+            depth,
         }
     }
 
@@ -410,7 +417,7 @@ impl Lexer {
                 flush(w, lit);
                 let l = self.line;
                 let inner = self.capture_balanced('{', '}');
-                w.parts.push(parse_param(&inner, l));
+                w.parts.push(parse_param(&inner, l, self.depth));
             }
             Some('\'') if !in_dquote => {
                 self.i += 1;
@@ -608,13 +615,20 @@ fn delimiter_text(w: &Word) -> String {
 }
 
 /// Interpret the inside of `${...}`.
-fn parse_param(inner: &str, line: usize) -> Part {
+fn parse_param(inner: &str, line: usize, depth: usize) -> Part {
+    if depth >= MAX_PARAM_DEPTH {
+        return Part::Param {
+            name: inner.to_string(),
+            fallback: None,
+        };
+    }
     // `${!ref:-default}` is indirect: the name can't be resolved, the fallback can.
-    if let Some(rest) = inner.strip_prefix('!') {
+    // (`${!!x}` isn't valid shell, so only one `!` is looked through.)
+    if let Some(rest) = inner.strip_prefix('!').filter(|r| !r.starts_with('!')) {
         if let Part::Param {
             name,
             fallback: Some(fb),
-        } = parse_param(rest, line)
+        } = parse_param(rest, line, depth)
         {
             return Part::Param {
                 name: format!("!{name}"),
@@ -645,7 +659,7 @@ fn parse_param(inner: &str, line: usize) -> Part {
     }
     for op in [":-", ":=", "-", "="] {
         if let Some(default) = rest.strip_prefix(op) {
-            let mut lx = Lexer::new(default, line);
+            let mut lx = Lexer::new(default, line, depth + 1);
             let mut w = Word::default();
             let mut lit = String::new();
             lx.read_dquoted(&mut w, &mut lit, None);

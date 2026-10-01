@@ -15,7 +15,7 @@ line, and what you expected. A reduced snippet that reproduces it is gold.
 
 ## Codebase tour
 
-Everything is in `src/`, with zero dependencies:
+Everything is in `src/`, nine files with zero dependencies:
 
 | File | What it does |
 | --- | --- |
@@ -24,7 +24,10 @@ Everything is in `src/`, with zero dependencies:
 | `analyze.rs` | The rules. `Analyzer::dispatch` is a big `match` on the command name. Start there. |
 | `render.rs` | Terminal and JSON output. |
 | `sha256.rs` | A tiny SHA-256 so reports can pin exact bytes. |
-| `main.rs` | CLI flags, policy exit codes and `--run`. |
+| `guard.rs` | Agent guard behind `soothsay hook` / `--check-command`: blocks remote code, reviews and pins it. Must fail closed. |
+| `json.rs` | Just enough JSON to read hook input. |
+| `main.rs` | CLI flags, policy exit codes, `--run`, and the `hook` entry point. |
+| `lib.rs` | The library entry point: `soothsay::analyze()` and re-exports. |
 
 The flow for each command is:
 
@@ -53,13 +56,26 @@ The flow for each command is:
      (persistence, nested `curl | sh`, `/etc` writes).
    - **notice**: normal installer behaviour worth listing (profile edits, `sudo`).
    - **info**: bookkeeping, hidden unless `-v`.
-4. Run the checks CI runs:
+4. Run the checks CI runs (CI also builds on the MSRV, Rust 1.74, so avoid newer
+   std APIs):
 
    ```sh
    cargo fmt --check
-   cargo clippy --all-targets -- -D warnings
-   cargo test
+   cargo clippy --locked --all-targets -- -D warnings
+   cargo test --locked
    ```
+
+## Bypasses and robustness
+
+- **Every bypass gets a regression test.** If you fix a way for a hostile script to
+  get a clean verdict, add the smallest script that reproduced it as a test in the
+  test file for that area under `tests/` (lexing, parsing/reachability, rules,
+  rendering, CLI), and assert the finding *and* its severity.
+- **A crash or a hang is a bug, not an edge case.** If some input makes soothsay
+  panic, overflow the stack or take seconds instead of milliseconds, that's a way to
+  make CI or an agent hook fail open. Add the input (or a generator for it) to the
+  tests.
+- Security-relevant bypasses go through [SECURITY.md](SECURITY.md), not a public issue.
 
 ## Ground rules
 

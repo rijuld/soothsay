@@ -1,5 +1,6 @@
 //! Human and machine output.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use crate::analyze::{shorten, Category, Finding, Report, Severity, Touch};
@@ -68,6 +69,38 @@ pub fn verdict(max: Option<Severity>) -> (&'static str, &'static str) {
 
 const CAP: usize = 8;
 
+/// Make script-derived text safe to print on a terminal.
+///
+/// The script decides what goes into paths, URLs and snippets, so it could
+/// otherwise embed escape sequences that hide lines, move the cursor or
+/// reorder text. Control, bidi and zero-width characters are shown as
+/// visible escapes instead; a newline becomes `⏎`.
+pub fn clean(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' => out.push_str(" ⏎ "),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\u{1b}' => out.push_str("\\x1b"),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+                let _ = write!(out, "\\x{:02x}", c as u32);
+            }
+            '\u{80}'..='\u{9f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{061c}'
+            | '\u{2060}'
+            | '\u{feff}' => {
+                let _ = write!(out, "\\u{{{:x}}}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 pub fn text(r: &Report, o: &Options) -> String {
     let p = Paint(o.color);
     let mut out = String::new();
@@ -78,12 +111,19 @@ pub fn text(r: &Report, o: &Options) -> String {
         p.bold("soothsay"),
         p.dim(&format!(
             "{} · {} lines · {} · sha256 {}",
-            o.source, r.lines, r.interpreter, short_hash
+            clean(&o.source),
+            r.lines,
+            clean(&r.interpreter),
+            short_hash
         ))
     );
 
     let mut shown_any = false;
-    let mut hidden = 0usize;
+    // Hidden because they're low-level, vs. hidden because they sit in a
+    // function soothsay thinks is never called. The second kind can be a
+    // script hiding from the reader, so it's never called "low-level".
+    let mut hidden_info = 0usize;
+    let mut hidden_unreachable = 0usize;
     for cat in Category::ALL {
         let mut items: Vec<&Finding> = r
             .findings
@@ -92,7 +132,15 @@ pub fn text(r: &Report, o: &Options) -> String {
                 f.category == cat && (o.verbose || (f.severity > Severity::Info && f.reachable))
             })
             .collect();
-        hidden += r.findings.iter().filter(|f| f.category == cat).count() - items.len();
+        if !o.verbose {
+            for f in r.findings.iter().filter(|f| f.category == cat) {
+                if !f.reachable {
+                    hidden_unreachable += 1;
+                } else if f.severity == Severity::Info {
+                    hidden_info += 1;
+                }
+            }
+        }
         if items.is_empty() {
             continue;
         }
@@ -105,16 +153,20 @@ pub fn text(r: &Report, o: &Options) -> String {
         });
         // The same thing on several lines is one entry: "L177 (also L197, L229)".
         let mut grouped: Vec<(&Finding, Vec<usize>)> = Vec::new();
+        let mut index: HashMap<(&str, Option<&str>, bool, Severity), usize> = HashMap::new();
         for f in items.iter().copied() {
-            let same = grouped.iter_mut().find(|(g, _)| {
-                g.message == f.message
-                    && g.detail == f.detail
-                    && g.reachable == f.reachable
-                    && g.severity == f.severity
-            });
-            match same {
-                Some((_, lines)) => lines.push(f.line),
-                None => grouped.push((f, Vec::new())),
+            let key = (
+                f.message.as_str(),
+                f.detail.as_deref(),
+                f.reachable,
+                f.severity,
+            );
+            match index.get(&key) {
+                Some(&i) => grouped[i].1.push(f.line),
+                None => {
+                    index.insert(key, grouped.len());
+                    grouped.push((f, Vec::new()));
+                }
             }
         }
         let top = items
@@ -133,7 +185,7 @@ pub fn text(r: &Report, o: &Options) -> String {
         let limit = if o.verbose { usize::MAX } else { CAP };
         for (f, also) in grouped.iter().take(limit) {
             let loc = format!("L{:<5}", f.line);
-            let mut msg = f.message.clone();
+            let mut msg = clean(&f.message);
             if !also.is_empty() {
                 let lines: Vec<String> = also.iter().take(6).map(|l| format!("L{l}")).collect();
                 let more = if also.len() > 6 { ", …" } else { "" };
@@ -145,14 +197,14 @@ pub fn text(r: &Report, o: &Options) -> String {
             if !f.reachable {
                 msg = p.dim(&format!(
                     "{msg}  (in {}(), which is never called)",
-                    f.function.as_deref().unwrap_or("?")
+                    clean(f.function.as_deref().unwrap_or("?"))
                 ));
             } else {
                 msg = p.sev(f.severity, icon(f.severity)) + " " + &msg;
             }
             let _ = writeln!(out, "    {} {}", p.dim(&loc), msg);
             if let Some(d) = &f.detail {
-                let _ = writeln!(out, "           {}", p.dim(&format!("↳ {d}")));
+                let _ = writeln!(out, "           {}", p.dim(&format!("↳ {}", clean(d))));
             }
         }
         if grouped.len() > limit {
@@ -169,25 +221,31 @@ pub fn text(r: &Report, o: &Options) -> String {
 
     // Files, deduplicated by path, most interesting first.
     let mut files: Vec<(String, Vec<Touch>, bool)> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
     for f in &r.files {
         if f.path == "." || (!f.reachable && !o.verbose) {
             continue;
         }
-        match files.iter_mut().find(|(path, _, _)| *path == f.path) {
-            Some((_, hows, root)) => {
+        let path = clean(&f.path);
+        match index.get(&path) {
+            Some(&i) => {
+                let (_, hows, root) = &mut files[i];
                 if !hows.contains(&f.how) {
                     hows.push(f.how);
                 }
                 *root |= f.as_root;
             }
-            None => files.push((f.path.clone(), vec![f.how], f.as_root)),
+            None => {
+                index.insert(path.clone(), files.len());
+                files.push((path, vec![f.how], f.as_root));
+            }
         }
     }
     if !files.is_empty() {
         let _ = writeln!(out, "\n  {}", p.bold("FILES IT TOUCHES"));
         let width = files
             .iter()
-            .map(|(path, _, _)| path.chars().count())
+            .map(|(path, _, _)| shorten(path, 60).chars().count())
             .max()
             .unwrap_or(0)
             .min(60);
@@ -214,10 +272,12 @@ pub fn text(r: &Report, o: &Options) -> String {
         }
     }
 
-    let mut urls: Vec<(&str, &str)> = Vec::new();
+    let mut urls: Vec<(String, &str)> = Vec::new();
+    let mut seen = HashSet::new();
     for u in &r.urls {
-        if !urls.iter().any(|(x, _)| *x == u.url) {
-            urls.push((&u.url, u.action));
+        let url = clean(&u.url);
+        if seen.insert(url.clone()) {
+            urls.push((url, u.action));
         }
     }
     if !urls.is_empty() {
@@ -248,13 +308,48 @@ pub fn text(r: &Report, o: &Options) -> String {
     if !counts.is_empty() {
         let _ = writeln!(out, "     {}", counts.join(p.dim(" · ").as_str()));
     }
-    if hidden > 0 {
+    let serious_unreachable = r
+        .findings
+        .iter()
+        .filter(|f| !f.reachable && f.severity >= Severity::Warn)
+        .count();
+    if serious_unreachable > 0 {
+        let more = if o.verbose { "" } else { " (use -v)" };
+        let _ = writeln!(
+            out,
+            "     {}",
+            p.sev(
+                Severity::Warn,
+                &format!(
+                    "{} {serious_unreachable} {} in functions soothsay thinks are never called{more}",
+                    icon(Severity::Warn),
+                    if serious_unreachable == 1 {
+                        "warning/danger"
+                    } else {
+                        "warnings/dangers"
+                    }
+                )
+            )
+        );
+    }
+    let quiet_unreachable = hidden_unreachable.saturating_sub(serious_unreachable);
+    if quiet_unreachable > 0 {
         let _ = writeln!(
             out,
             "     {}",
             p.dim(&format!(
-                "{hidden} low-level {} hidden (use -v)",
-                plural("note", hidden)
+                "{quiet_unreachable} more {} in never-called functions hidden (use -v)",
+                plural("note", quiet_unreachable)
+            ))
+        );
+    }
+    if hidden_info > 0 {
+        let _ = writeln!(
+            out,
+            "     {}",
+            p.dim(&format!(
+                "{hidden_info} low-level {} hidden (use -v)",
+                plural("note", hidden_info)
             ))
         );
     }
@@ -305,6 +400,7 @@ fn opt(s: &Option<String>) -> String {
 
 pub fn json(r: &Report, source: &str) -> String {
     let mut out = String::from("{\n");
+    let _ = writeln!(out, "  \"schema_version\": 1,");
     let _ = writeln!(out, "  \"tool\": \"soothsay\",");
     let _ = writeln!(
         out,
@@ -350,11 +446,12 @@ pub fn json(r: &Report, source: &str) -> String {
         .iter()
         .map(|f| {
             format!(
-                "    {{ \"path\": {}, \"how\": {}, \"line\": {}, \"as_root\": {} }}",
+                "    {{ \"path\": {}, \"how\": {}, \"line\": {}, \"as_root\": {}, \"reachable\": {} }}",
                 json_str(&f.path),
                 json_str(f.how.id()),
                 f.line,
-                f.as_root
+                f.as_root,
+                f.reachable
             )
         })
         .collect();

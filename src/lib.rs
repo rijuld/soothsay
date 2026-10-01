@@ -19,9 +19,25 @@
 //! downloads and runs is listed as a *blind spot* rather than guessed at.
 
 pub mod analyze;
+pub mod guard;
+pub mod json;
 pub mod lexer;
 pub mod parse;
 pub mod render;
 pub mod sha256;
 
 pub use analyze::{analyze, Category, FileTouch, Finding, Report, Severity, Touch, Url};
+
+/// Like [`analyze`], but for raw bytes: invalid UTF-8 is replaced for the
+/// analysis, while `sha256` is the hash of the bytes exactly as given (what a
+/// shell would run), not of the decoded text.
+///
+/// ```
+/// let r = soothsay::analyze_bytes(b"echo \xff\n");
+/// assert_eq!(r.sha256, soothsay::sha256::hex(b"echo \xff\n"));
+/// ```
+pub fn analyze_bytes(bytes: &[u8]) -> Report {
+    let mut report = analyze(&String::from_utf8_lossy(bytes));
+    report.sha256 = sha256::hex(bytes);
+    report
+}
