@@ -1,8 +1,10 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
+use std::path::PathBuf;
 use std::process::{self, Stdio};
 
-use soothsay::{render, Category, Severity};
+use soothsay::guard::{self, Decision, Guard, KNOWN_SHELLS, MAX_SCRIPT as MAX_INPUT};
+use soothsay::{json, render, Category, Severity};
 
 const HELP: &str = "\
 soothsay: read the omens before you `curl | sh`
@@ -10,6 +12,8 @@ soothsay: read the omens before you `curl | sh`
 USAGE
     curl -fsSL https://example.com/install.sh | soothsay [OPTIONS]
     soothsay [OPTIONS] install.sh
+    soothsay --check-command '<shell command>'
+    soothsay hook                 (Claude Code PreToolUse hook; JSON on stdin)
 
     Reads a shell script and tells you what it will do to your machine before
     you run it: files written, shell profiles edited, sudo, startup items,
@@ -41,6 +45,19 @@ OPTIONS
     Arguments after `--` are passed to the script by --run:
         curl -fsSL https://sh.rustup.rs | soothsay --run -- -y
 
+GUARDING AN AGENT
+    --check-command <CMD>  If CMD runs code from the network (`curl … | sh`,
+                           `bash <(curl …)`, or a file an earlier checked command
+                           downloaded), fetch that script, review it, save the
+                           exact bytes, and explain how to run them. Exit 0 if
+                           there's nothing to review, 1 if blocked. Use - to read
+                           CMD from stdin.
+    hook                   The same check as a Claude Code PreToolUse hook: reads
+                           the hook JSON on stdin, exits 2 (block) with the
+                           review on stderr, and blocks on any internal error.
+    Reviewed scripts go to $SOOTHSAY_CACHE, $XDG_CACHE_HOME/soothsay, or
+    ~/.cache/soothsay. Downloads use your `curl`.
+
 EXIT STATUS
     0  report printed (and, with --run, the script's own exit status)
     1  a --deny / --fail-on policy matched
@@ -48,12 +65,6 @@ EXIT STATUS
     2  usage or I/O error, or input that isn't a shell script
        (empty, HTML, binary, or over 16 MiB)
 ";
-
-/// Refuse anything bigger: no real installer is this large.
-const MAX_INPUT: u64 = 16 * 1024 * 1024;
-
-/// Shells whose syntax soothsay actually understands.
-const KNOWN_SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "mksh", "ash"];
 
 struct Args {
     file: Option<String>,
@@ -171,6 +182,33 @@ fn parse_args() -> Args {
 }
 
 fn main() {
+    let mut argv = std::env::args().skip(1);
+    match argv.next().as_deref() {
+        Some("hook") => hook(),
+        Some("--check-command") => {
+            let cmd = match argv.next() {
+                Some(c) if c == "-" => {
+                    let mut s = String::new();
+                    io::stdin()
+                        .take(1024 * 1024)
+                        .read_to_string(&mut s)
+                        .unwrap_or_else(|e| die(&format!("reading stdin: {e}")));
+                    s
+                }
+                Some(c) => c,
+                None => die("--check-command needs a command (or - for stdin)"),
+            };
+            let cwd = std::env::current_dir().unwrap_or_else(|e| die(&format!("cwd: {e}")));
+            match check(&cmd, cwd) {
+                Decision::Pass => process::exit(0),
+                Decision::Block(msg) => {
+                    println!("{msg}");
+                    process::exit(1);
+                }
+            }
+        }
+        _ => {}
+    }
     let args = parse_args();
 
     let (source, bytes) = match args.file.as_deref() {
@@ -193,7 +231,7 @@ fn main() {
     if bytes.len() as u64 > MAX_INPUT {
         die("input is over 16 MiB; that's not an install script, refusing to read it");
     }
-    if let Some(why) = not_a_script(&bytes) {
+    if let Some(why) = guard::not_a_script(&bytes) {
         die(why);
     }
     let report = soothsay::analyze_bytes(&bytes);
@@ -340,27 +378,6 @@ fn read_capped(r: impl Read) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Inputs that are clearly not a shell script, with the reason to give.
-fn not_a_script(bytes: &[u8]) -> Option<&'static str> {
-    let Some(start) = bytes.iter().position(|b| !b.is_ascii_whitespace()) else {
-        return Some("empty input: did the download fail? (curl -f prints nothing on HTTP errors)");
-    };
-    if bytes.contains(&0) {
-        return Some("input contains NUL bytes: this isn't a shell script");
-    }
-    let head = &bytes[start..bytes.len().min(start + 9)];
-    if head.eq_ignore_ascii_case(b"<!doctype")
-        || head
-            .get(..5)
-            .is_some_and(|h| h.eq_ignore_ascii_case(b"<html"))
-    {
-        return Some(
-            "input looks like an HTML page, not a shell script (wrong URL, or an error page?)",
-        );
-    }
-    None
-}
-
 /// The script's exit status, or 128+N if signal N killed it, as shells report it.
 fn exit_code(s: process::ExitStatus) -> i32 {
     #[cfg(unix)]
@@ -371,4 +388,116 @@ fn exit_code(s: process::ExitStatus) -> i32 {
         }
     }
     s.code().unwrap_or(1)
+}
+
+fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+}
+
+fn check(command: &str, cwd: PathBuf) -> Decision {
+    let home = home();
+    let Some(cache) = guard::default_cache(home.as_deref()) else {
+        return Decision::Block(
+            "soothsay: no cache directory (set SOOTHSAY_CACHE or HOME); blocking to be safe".into(),
+        );
+    };
+    let g = Guard {
+        cwd,
+        home,
+        cache,
+        fetch: &fetch,
+    };
+    g.check(command)
+}
+
+/// Download a script with the user's `curl`, the same client a `curl | sh`
+/// would have used, so a server that cloaks by user agent serves us the same
+/// bytes.
+fn fetch(url: &str) -> Result<Vec<u8>, String> {
+    let mut child = process::Command::new("curl")
+        .args([
+            "-fsSL",
+            "--proto",
+            "=https,http",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "30",
+            "--max-filesize",
+            "16777216",
+            "--",
+            url,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("running curl: {e}"))?;
+    let mut body = Vec::new();
+    if let Some(out) = child.stdout.take() {
+        out.take(MAX_INPUT + 1)
+            .read_to_end(&mut body)
+            .map_err(|e| format!("reading curl output: {e}"))?;
+    }
+    let mut err = String::new();
+    if let Some(e) = child.stderr.take() {
+        let _ = e.take(4096).read_to_string(&mut err);
+    }
+    let status = child.wait().map_err(|e| format!("waiting for curl: {e}"))?;
+    if !status.success() {
+        let why = err.lines().next().unwrap_or("").trim();
+        return Err(format!(
+            "curl exited with {}{}{why}",
+            exit_code(status),
+            if why.is_empty() { "" } else { ": " }
+        ));
+    }
+    Ok(body)
+}
+
+/// `soothsay hook`: a Claude Code PreToolUse hook. Exit 0 lets the command
+/// through; exit 2 blocks it and hands stderr to Claude. Every failure,
+/// including a panic, blocks: any other exit code would let the command run.
+fn hook() -> ! {
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("soothsay hook crashed ({info}); blocking this command to be safe.");
+        process::exit(2);
+    }));
+    let block = |msg: &str| -> ! {
+        eprintln!("{msg}");
+        process::exit(2);
+    };
+    let mut input = String::new();
+    if let Err(e) = io::stdin().take(4 * 1024 * 1024).read_to_string(&mut input) {
+        block(&format!(
+            "soothsay hook: reading input: {e}; blocking to be safe"
+        ));
+    }
+    let v = json::parse(&input).unwrap_or_else(|e| {
+        block(&format!(
+            "soothsay hook: input isn't valid JSON ({e}); blocking to be safe"
+        ))
+    });
+    if v.get("tool_name").and_then(json::Value::as_str) != Some("Bash") {
+        process::exit(0);
+    }
+    let Some(command) = v
+        .get("tool_input")
+        .and_then(|t| t.get("command"))
+        .and_then(json::Value::as_str)
+    else {
+        block("soothsay hook: Bash call without a command string; blocking to be safe");
+    };
+    let cwd = v
+        .get("cwd")
+        .and_then(json::Value::as_str)
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| block("soothsay hook: no working directory; blocking to be safe"));
+    match check(command, cwd) {
+        Decision::Pass => process::exit(0),
+        Decision::Block(msg) => block(&msg),
+    }
 }

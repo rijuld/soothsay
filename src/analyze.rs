@@ -219,6 +219,11 @@ pub struct Report {
     pub urls: Vec<Url>,
     /// Functions defined, and whether anything calls them.
     pub functions: Vec<(String, bool)>,
+    /// Files the script saves from the network: (path, url, line).
+    pub downloads: Vec<(String, String, usize)>,
+    /// Local files the script runs as code (`sh x.sh`, `. ./env`, `./tool`),
+    /// with the line. Used to follow a download into a later command.
+    pub executed: Vec<(String, usize)>,
 }
 
 impl Report {
@@ -325,6 +330,8 @@ pub fn analyze(src: &str) -> Report {
         .map(|(n, _)| (n.clone(), live.contains(n)))
         .collect();
 
+    let mut downloads: Vec<_> = a.downloads.into_values().collect();
+    downloads.sort_by(|x, y| (x.2, &x.0).cmp(&(y.2, &y.0)));
     Report {
         lines: src.lines().count(),
         sha256: crate::sha256::hex(src.as_bytes()),
@@ -333,6 +340,8 @@ pub fn analyze(src: &str) -> Report {
         files: a.files,
         urls: a.urls,
         functions,
+        downloads,
+        executed: a.executed,
     }
 }
 
@@ -634,6 +643,8 @@ struct Analyzer {
     downloads: HashMap<String, (String, String, usize)>,
     /// URLs whose downloaded file is later run; marked "run" once analysis ends.
     ran_urls: HashSet<String>,
+    /// Local files run as code: (path, line).
+    executed: Vec<(String, usize)>,
     /// Text of the most recent literal `echo`/`printf`, for `( …; echo x ) | crontab -`.
     last_echo: Option<String>,
 }
@@ -2410,10 +2421,22 @@ impl Analyzer {
     /// `sh /tmp/x.sh`, `. "$tmp"`, `"$tmp/tool"` where that file was downloaded
     /// earlier in the script.
     fn ran_download(&mut self, h: &Head, ctx: &Ctx) {
+        let n = h.name.as_str();
+        let ran = if matches!(n, "." | "source") {
+            h.args.get(1).cloned()
+        } else if INTERPRETERS.contains(&n) && !h.has("-c") {
+            h.positional(&["-o", "-O", "-W", "-X", "-m"])
+                .into_iter()
+                .find(|p| p != "-")
+        } else {
+            h.args.first().filter(|a| a.contains('/')).cloned()
+        };
+        if let Some(path) = ran.filter(|p| !p.is_empty() && !is_system_path(p)) {
+            self.executed.push((path, ctx.line));
+        }
         if self.downloads.is_empty() {
             return;
         }
-        let n = h.name.as_str();
         let find = |p: &str| self.downloads.get(&download_key(p)).cloned();
         let (hit, interpreted) = match h.args.first().and_then(|a| find(a)) {
             Some(d) => (Some(d), false),

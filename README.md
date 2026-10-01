@@ -194,6 +194,51 @@ Exit codes: `0` ok · `1` policy matched · `2` usage or I/O error, or input tha
 script soothsay can read (empty, an HTML error page, a non-shell interpreter). In
 automation, treat anything other than `0` as "don't run".
 
+### Guarding an AI agent
+
+Coding agents run `curl … | sh` too, usually without showing anyone the script. As a
+[Claude Code](https://code.claude.com/docs/en/hooks) `PreToolUse` hook, soothsay stops
+that before it happens:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [{ "type": "command", "command": "soothsay hook", "timeout": 120 }]
+      }
+    ]
+  }
+}
+```
+
+Put that in `~/.claude/settings.json` (or a project's `.claude/settings.json`). For
+every Bash command the agent is about to run, soothsay:
+
+1. lets it through untouched if it doesn't run code from the network;
+2. otherwise blocks it, downloads the script itself with your `curl`, reviews it, and
+   saves the exact bytes under `~/.cache/soothsay/<sha256>.sh`;
+3. tells the agent what the script does and how to run *those* bytes once the user
+   agrees: `soothsay --run --yes --expect-sha256 <sha256> <saved file>`. A dangerous
+   script gets no run instructions at all.
+
+It also catches the two-step version: a file downloaded by one command
+(`curl -o i.sh …`) and run by a later one (`sh i.sh`).
+
+The hook fails closed. An unresolvable URL, a failed download, an HTML error page, a
+non-shell script, bad input or a crash all block the command (exit `2`); Claude Code
+lets a command through on any other exit code, so soothsay never uses one. Script
+text in the message is escaped and labelled as data, not instructions.
+
+`soothsay --check-command '<cmd>'` runs the same check for other harnesses: exit `0`
+if there's nothing to review, `1` with the review on stdout if the command is blocked.
+
+Limits: it reviews the script, not the binaries the script downloads and runs (those
+stay blind spots). A command split across `cd` and a relative path may not match an
+earlier download. If the hook times out, Claude Code falls back to its normal
+permission prompt.
+
 ## What it detects
 
 ```text
@@ -310,7 +355,7 @@ soothsay decide whether they run.
 
 Contributions are very welcome, especially **real-world false positives and misses**.
 If soothsay misreads an installer you use, that's a bug. See
-[CONTRIBUTING.md](CONTRIBUTING.md) for the codebase tour (seven small files) and how to add
+[CONTRIBUTING.md](CONTRIBUTING.md) for the codebase tour (nine small files) and how to add
 a rule with a test.
 
 If you find a way to get a clean verdict for a hostile script, or to mess with the
@@ -330,9 +375,8 @@ Good first issues are marked 🌱.
 - Follow `curl … -o x.sh; sh x.sh` within the same script (analyze the file it runs when
   its URL is known)
 - A small constant-propagation pass so `for f in a b; do … "$f"` resolves
-- `--check-command '<cmd>'`: take the command line an agent is about to run
-  (`curl … | sh`), fetch the script once, analyze it, and exit with a block/allow
-  code a harness hook can enforce
+- Hook mode: when the user approves, rewrite the agent's command to the pinned
+  `soothsay --run` call (`updatedInput`) instead of asking the agent to retype it
 - Cloaking detection: fetch the script as `curl` and as a browser and compare hashes,
   since servers can serve a different script to a pipe
 - Publish to crates.io

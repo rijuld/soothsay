@@ -15,7 +15,7 @@ line, and what you expected. A reduced snippet that reproduces it is gold.
 
 ## Codebase tour
 
-Everything is in `src/`, seven files with zero dependencies:
+Everything is in `src/`, nine files with zero dependencies:
 
 | File | What it does |
 | --- | --- |
@@ -24,7 +24,9 @@ Everything is in `src/`, seven files with zero dependencies:
 | `analyze.rs` | The rules. `Analyzer::dispatch` is a big `match` on the command name. Start there. |
 | `render.rs` | Terminal and JSON output. |
 | `sha256.rs` | A tiny SHA-256 so reports can pin exact bytes. |
-| `main.rs` | CLI flags, policy exit codes and `--run`. |
+| `guard.rs` | Agent guard behind `soothsay hook` / `--check-command`: blocks remote code, reviews and pins it. Must fail closed. |
+| `json.rs` | Just enough JSON to read hook input. |
+| `main.rs` | CLI flags, policy exit codes, `--run`, and the `hook` entry point. |
 | `lib.rs` | The library entry point: `soothsay::analyze()` and re-exports. |
 
 The flow for each command is:
