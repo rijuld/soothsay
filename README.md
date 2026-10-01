@@ -5,7 +5,8 @@
 **Read the omens before you `curl | sh`.**
 
 `soothsay` reads a shell install script and tells you, in plain English, what it's
-about to do to your machine *before* you run it.
+about to do to your machine *before* you run it. As a Claude Code hook, it also stops
+AI coding agents from piping installers into your shell until you've seen what they do.
 
 ![license: MIT](https://img.shields.io/badge/license-MIT-blue)
 ![dependencies: 0](https://img.shields.io/badge/dependencies-0-brightgreen)
@@ -16,6 +17,16 @@ curl -fsSL https://example.com/install.sh | soothsay
 ```
 
 </div>
+
+**Guard Claude Code** (needs the `soothsay` binary, see [Install](#install)):
+
+```text
+/plugin marketplace add rijuld/soothsay
+/plugin install soothsay@soothsay
+```
+
+Claude's `curl … | sh` is then blocked, reviewed, pinned to the exact bytes, and put to
+you for approval. [How it works](#guarding-an-ai-agent).
 
 ---
 
@@ -200,7 +211,18 @@ automation, treat anything other than `0` as "don't run".
 
 Coding agents run `curl … | sh` too, usually without showing anyone the script. As a
 [Claude Code](https://code.claude.com/docs/en/hooks) `PreToolUse` hook, soothsay stops
-that before it happens:
+that before it happens.
+
+The easy way is the plugin, which registers the hook for you:
+
+```text
+/plugin marketplace add rijuld/soothsay
+/plugin install soothsay@soothsay
+```
+
+It finds `soothsay` on your `PATH` or in `~/.cargo/bin` (or `$SOOTHSAY_BIN`). If the
+binary is missing, it blocks only commands that look like they run downloaded code, and
+says how to install it. To wire the hook up by hand instead:
 
 ```json
 {

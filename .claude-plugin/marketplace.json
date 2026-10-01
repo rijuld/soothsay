@@ -1,0 +1,17 @@
+{
+  "name": "soothsay",
+  "owner": {
+    "name": "rijuld",
+    "url": "https://github.com/rijuld"
+  },
+  "description": "soothsay: stop AI coding agents from running curl | sh installers nobody has read.",
+  "plugins": [
+    {
+      "name": "soothsay",
+      "source": "./plugin",
+      "description": "Blocks Bash commands that run scripts from the network, reviews the script, pins the exact bytes, and asks you before they run.",
+      "category": "security",
+      "tags": ["security", "curl-pipe-bash", "installers", "supply-chain", "hooks"]
+    }
+  ]
+}

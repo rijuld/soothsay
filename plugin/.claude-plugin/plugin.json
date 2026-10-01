@@ -1,0 +1,14 @@
+{
+  "name": "soothsay",
+  "displayName": "soothsay",
+  "version": "0.1.0",
+  "description": "Read the omens before Claude runs curl | sh: blocks commands that run scripts from the network, reviews the script, pins the exact bytes, and asks you before they run.",
+  "author": {
+    "name": "rijuld",
+    "url": "https://github.com/rijuld"
+  },
+  "homepage": "https://github.com/rijuld/soothsay#guarding-an-ai-agent",
+  "repository": "https://github.com/rijuld/soothsay",
+  "license": "MIT",
+  "keywords": ["security", "curl-pipe-bash", "install-script", "supply-chain", "hooks", "shell"]
+}

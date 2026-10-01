@@ -5,9 +5,13 @@ edition = "2021"
 rust-version = "1.74"
 description = "Read the omens before you `curl | sh`: explains what a shell install script will do to your machine, before it does it."
 license = "MIT"
+repository = "https://github.com/rijuld/soothsay"
+homepage = "https://github.com/rijuld/soothsay"
 readme = "README.md"
 keywords = ["security", "shell", "installer", "static-analysis", "cli"]
 categories = ["command-line-utilities", "development-tools"]
+# Only what builds the crate; the plugin, fixtures and CI stay in the repo.
+include = ["src/**/*.rs", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
 
 [dependencies]
 # Deliberately none. A tool you pipe untrusted scripts into should be small
