@@ -74,5 +74,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
+          # v1.2.3-rc.1 and friends are pre-releases, never "Latest".
+          pre=""
+          case "$TAG" in *-*) pre="--prerelease" ;; esac
+          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS $pre \
             --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes --verify-tag
