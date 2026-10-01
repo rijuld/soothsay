@@ -24,7 +24,9 @@ OPTIONS
         --json             Machine-readable report on stdout
         --run              After the report, ask on your terminal, then run the
                            *exact bytes* that were analyzed (never re-downloads)
-    -y, --yes              With --run: don't ask (policy flags still apply)
+    -y, --yes              With --run: don't ask (policy flags still apply, and a
+                           script with danger findings still isn't run)
+        --allow-danger     With --run --yes: run even if there are danger findings
         --shell <SH>       Interpreter for --run (default: the script's shebang, else sh)
         --expect-sha256 <HEX>
                            Exit 1 unless the script's sha256 is exactly this
@@ -50,11 +52,13 @@ GUARDING AN AGENT
                            `bash <(curl …)`, or a file an earlier checked command
                            downloaded), fetch that script, review it, save the
                            exact bytes, and explain how to run them. Exit 0 if
-                           there's nothing to review, 1 if blocked. Use - to read
-                           CMD from stdin.
+                           there's nothing to review, 1 if blocked, 3 if it runs
+                           reviewed bytes and the user should approve (review on
+                           stdout). Use - to read CMD from stdin.
     hook                   The same check as a Claude Code PreToolUse hook: reads
                            the hook JSON on stdin, exits 2 (block) with the
-                           review on stderr, and blocks on any internal error.
+                           review on stderr, asks the user (an \"ask\" decision) before
+                           a reviewed script runs, and blocks on any internal error.
     Reviewed scripts go to $SOOTHSAY_CACHE, $XDG_CACHE_HOME/soothsay, or
     ~/.cache/soothsay. Downloads use your `curl`.
 
@@ -77,6 +81,7 @@ struct Args {
     deny: Vec<Category>,
     fail_on: Option<Severity>,
     ignore_unreachable: bool,
+    allow_danger: bool,
     color: bool,
     script_args: Vec<String>,
 }
@@ -102,6 +107,7 @@ fn parse_args() -> Args {
         deny: Vec::new(),
         fail_on: None,
         ignore_unreachable: false,
+        allow_danger: false,
         color: std::env::var_os("NO_COLOR").is_none() && io::stdout().is_terminal(),
         script_args: Vec::new(),
     };
@@ -138,6 +144,7 @@ fn parse_args() -> Args {
             "-y" | "--yes" => a.yes = true,
             "--no-color" => a.color = false,
             "--ignore-unreachable" => a.ignore_unreachable = true,
+            "--allow-danger" => a.allow_danger = true,
             "--shell" => a.shell = Some(value("--shell")),
             "--expect-sha256" => {
                 let v = value("--expect-sha256").to_ascii_lowercase();
@@ -199,11 +206,15 @@ fn main() {
                 None => die("--check-command needs a command (or - for stdin)"),
             };
             let cwd = std::env::current_dir().unwrap_or_else(|e| die(&format!("cwd: {e}")));
-            match check(&cmd, cwd) {
+            match check(&cmd, cwd, true) {
                 Decision::Pass => process::exit(0),
                 Decision::Block(msg) => {
                     println!("{msg}");
                     process::exit(1);
+                }
+                Decision::Ask(msg) => {
+                    println!("{msg}");
+                    process::exit(3);
                 }
             }
         }
@@ -294,6 +305,17 @@ fn main() {
     }
 
     if args.run {
+        let danger = report
+            .findings
+            .iter()
+            .any(|f| f.severity == Severity::Danger);
+        if danger && args.yes && !args.allow_danger {
+            eprintln!(
+                "soothsay: not running a script with danger findings unattended; \
+                 drop --yes to decide yourself, or pass --allow-danger"
+            );
+            process::exit(1);
+        }
         if !shell_script && args.shell.is_none() {
             eprintln!(
                 "soothsay: not running a {} script as shell; pass --shell <interpreter> if you really mean to",
@@ -396,7 +418,7 @@ fn home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn check(command: &str, cwd: PathBuf) -> Decision {
+fn check(command: &str, cwd: PathBuf, can_ask: bool) -> Decision {
     let home = home();
     let Some(cache) = guard::default_cache(home.as_deref()) else {
         return Decision::Block(
@@ -408,6 +430,7 @@ fn check(command: &str, cwd: PathBuf) -> Decision {
         home,
         cache,
         fetch: &fetch,
+        can_ask,
     };
     g.check(command)
 }
@@ -496,8 +519,22 @@ fn hook() -> ! {
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| block("soothsay hook: no working directory; blocking to be safe"));
-    match check(command, cwd) {
+    // Only modes that really stop and prompt the user can carry an "ask";
+    // anywhere else (or if the mode is unknown) a run of reviewed bytes blocks.
+    let can_ask = matches!(
+        v.get("permission_mode").and_then(json::Value::as_str),
+        Some("default" | "acceptEdits" | "plan")
+    );
+    match check(command, cwd, can_ask) {
         Decision::Pass => process::exit(0),
         Decision::Block(msg) => block(&msg),
+        Decision::Ask(msg) => {
+            println!(
+                "{{\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\",\
+                 \"permissionDecision\":\"ask\",\"permissionDecisionReason\":{}}}}}",
+                render::json_str(&msg)
+            );
+            process::exit(0);
+        }
     }
 }
