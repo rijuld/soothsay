@@ -1,5 +1,6 @@
 //! Human and machine output.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use crate::analyze::{shorten, Category, Finding, Report, Severity, Touch};
@@ -152,16 +153,20 @@ pub fn text(r: &Report, o: &Options) -> String {
         });
         // The same thing on several lines is one entry: "L177 (also L197, L229)".
         let mut grouped: Vec<(&Finding, Vec<usize>)> = Vec::new();
+        let mut index: HashMap<(&str, Option<&str>, bool, Severity), usize> = HashMap::new();
         for f in items.iter().copied() {
-            let same = grouped.iter_mut().find(|(g, _)| {
-                g.message == f.message
-                    && g.detail == f.detail
-                    && g.reachable == f.reachable
-                    && g.severity == f.severity
-            });
-            match same {
-                Some((_, lines)) => lines.push(f.line),
-                None => grouped.push((f, Vec::new())),
+            let key = (
+                f.message.as_str(),
+                f.detail.as_deref(),
+                f.reachable,
+                f.severity,
+            );
+            match index.get(&key) {
+                Some(&i) => grouped[i].1.push(f.line),
+                None => {
+                    index.insert(key, grouped.len());
+                    grouped.push((f, Vec::new()));
+                }
             }
         }
         let top = items
@@ -216,19 +221,24 @@ pub fn text(r: &Report, o: &Options) -> String {
 
     // Files, deduplicated by path, most interesting first.
     let mut files: Vec<(String, Vec<Touch>, bool)> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
     for f in &r.files {
         if f.path == "." || (!f.reachable && !o.verbose) {
             continue;
         }
         let path = clean(&f.path);
-        match files.iter_mut().find(|(p, _, _)| *p == path) {
-            Some((_, hows, root)) => {
+        match index.get(&path) {
+            Some(&i) => {
+                let (_, hows, root) = &mut files[i];
                 if !hows.contains(&f.how) {
                     hows.push(f.how);
                 }
                 *root |= f.as_root;
             }
-            None => files.push((path, vec![f.how], f.as_root)),
+            None => {
+                index.insert(path.clone(), files.len());
+                files.push((path, vec![f.how], f.as_root));
+            }
         }
     }
     if !files.is_empty() {
@@ -263,9 +273,10 @@ pub fn text(r: &Report, o: &Options) -> String {
     }
 
     let mut urls: Vec<(String, &str)> = Vec::new();
+    let mut seen = HashSet::new();
     for u in &r.urls {
         let url = clean(&u.url);
-        if !urls.iter().any(|(x, _)| *x == url) {
+        if seen.insert(url.clone()) {
             urls.push((url, u.action));
         }
     }
