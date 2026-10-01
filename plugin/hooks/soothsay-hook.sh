@@ -17,7 +17,7 @@ input=$(cat)
 if printf '%s' "$input" | grep -Eq 'curl|wget|aria2c|<\(|\| *(sudo +)?(ba|z|da|k)?sh'; then
     echo "soothsay plugin: the soothsay binary isn't installed (or is too old to have" \
         "'soothsay hook'), so this command can't be reviewed. Blocking it to be safe." \
-        "Ask the user to install it: https://github.com/rijuld/soothsay/releases/latest (or cargo install --locked --git https://github.com/rijuld/soothsay --tag v0.1.0)" >&2
+        "Ask the user to install it: cargo install --locked soothsay (or https://github.com/rijuld/soothsay/releases/latest)" >&2
     exit 2
 fi
 exit 0

@@ -8,6 +8,9 @@
 about to do to your machine *before* you run it. As a Claude Code hook, it also stops
 AI coding agents from piping installers into your shell until you've seen what they do.
 
+[![crates.io](https://img.shields.io/crates/v/soothsay)](https://crates.io/crates/soothsay)
+[![docs.rs](https://img.shields.io/docsrs/soothsay)](https://docs.rs/soothsay)
+[![CI](https://github.com/rijuld/soothsay/actions/workflows/ci.yml/badge.svg)](https://github.com/rijuld/soothsay/actions/workflows/ci.yml)
 ![license: MIT](https://img.shields.io/badge/license-MIT-blue)
 ![dependencies: 0](https://img.shields.io/badge/dependencies-0-brightgreen)
 ![rust: 1.74+](https://img.shields.io/badge/rust-1.74%2B-orange)
@@ -130,9 +133,13 @@ That's a well-behaved installer. Here's an excerpt of the report for
 
 ## Install
 
-Prebuilt binaries for macOS and Linux (x86_64 and arm64) are on the
-[releases page](https://github.com/rijuld/soothsay/releases/latest). Download yours, then
-check the hash and the build attestation before you put it on your `PATH`:
+```sh
+cargo install --locked soothsay
+```
+
+Or use a prebuilt binary for macOS or Linux (x86_64 and arm64) from the
+[releases page](https://github.com/rijuld/soothsay/releases/latest). Check the hash and
+the build attestation before you put it on your `PATH`:
 
 ```sh
 gh release download v0.1.0 --repo rijuld/soothsay -p SHA256SUMS -p '*aarch64-apple-darwin*'
@@ -141,16 +148,9 @@ gh attestation verify soothsay-v0.1.0-aarch64-apple-darwin.tar.gz --repo rijuld/
 tar xzf soothsay-v0.1.0-aarch64-apple-darwin.tar.gz
 ```
 
-Or build it with Cargo:
-
-```sh
-cargo install --locked --git https://github.com/rijuld/soothsay --tag v0.1.0
-```
-
 It's a single small binary with **zero dependencies**. That's on purpose: a tool you
 pipe untrusted scripts into should be small enough to audit in an afternoon. The whole
-thing is a few thousand lines of plain Rust. (It isn't on crates.io yet; publishing it is
-on the [roadmap](#roadmap).)
+thing is a few thousand lines of plain Rust.
 
 Every release attaches a `SHA256SUMS` file and a
 [build provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations)
@@ -192,8 +192,8 @@ If you maintain an `install.sh`, soothsay can keep it honest across PRs:
 
 ```yaml
 # .github/workflows/installer.yml
-# Pin a release tag (or a commit with --rev). Never install a security tool from a moving branch.
-- run: cargo install --locked --git https://github.com/rijuld/soothsay --tag v0.1.0
+# Pin a version. Never install a security tool from a moving branch.
+- run: cargo install --locked soothsay --version 0.1.0
 - run: soothsay --deny persistence,remote-exec,obfuscation --fail-on danger install.sh
 ```
 
@@ -425,7 +425,6 @@ Good first issues are marked 🌱.
   `soothsay --run` call (`updatedInput`) instead of asking the agent to retype it
 - Cloaking detection: fetch the script as `curl` and as a browser and compare hashes,
   since servers can serve a different script to a pipe
-- Publish to crates.io
 
 ## License
 
