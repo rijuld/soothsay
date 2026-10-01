@@ -311,6 +311,11 @@ pub fn analyze(src: &str) -> Report {
     for f in &mut a.files {
         f.reachable = reachable(&f.function);
     }
+    for u in &mut a.urls {
+        if a.ran_urls.contains(&u.url) {
+            u.action = "run";
+        }
+    }
 
     let mut seen = HashSet::new();
     let functions = a
@@ -625,8 +630,10 @@ struct Analyzer {
     /// since `findings` can be truncated.
     finding_index: HashMap<(Category, usize, String), usize>,
     file_index: HashSet<(String, Touch)>,
-    /// Files fetched from the network: (path, url, line).
-    downloads: Vec<(String, String, usize)>,
+    /// Files fetched from the network, keyed by [`download_key`]: (path, url, line).
+    downloads: HashMap<String, (String, String, usize)>,
+    /// URLs whose downloaded file is later run; marked "run" once analysis ends.
+    ran_urls: HashSet<String>,
     /// Text of the most recent literal `echo`/`printf`, for `( …; echo x ) | crontab -`.
     last_echo: Option<String>,
 }
@@ -2227,7 +2234,7 @@ impl Analyzer {
             .unwrap_or_else(|| "<unknown url>".into());
         for out in outputs {
             self.downloads
-                .push((tidy_path(&out), url.clone(), ctx.line));
+                .insert(download_key(&out), (tidy_path(&out), url.clone(), ctx.line));
         }
 
         // `curl … | sh`, `curl … | sudo bash -s -- --flag`
@@ -2407,15 +2414,7 @@ impl Analyzer {
             return;
         }
         let n = h.name.as_str();
-        let norm = |p: &str| tidy_path(p.strip_prefix("./").unwrap_or(p));
-        let find = |p: &str| {
-            let p = norm(p);
-            self.downloads
-                .iter()
-                .rev()
-                .find(|(d, _, _)| norm(d) == p)
-                .cloned()
-        };
+        let find = |p: &str| self.downloads.get(&download_key(p)).cloned();
         let (hit, interpreted) = match h.args.first().and_then(|a| find(a)) {
             Some(d) => (Some(d), false),
             None if matches!(n, "." | "source") => (h.args.get(1).and_then(|a| find(a)), true),
@@ -2431,9 +2430,7 @@ impl Analyzer {
         let Some((path, url, line)) = hit else {
             return;
         };
-        for u in self.urls.iter_mut().filter(|u| u.url == url) {
-            u.action = "run";
-        }
+        self.ran_urls.insert(url.clone());
         let script = interpreted
             || [".sh", ".bash", ".zsh", ".py", ".pl", ".rb"]
                 .iter()
@@ -3000,6 +2997,11 @@ fn assignment(w: &Word) -> Option<(String, Word)> {
 
 fn basename(p: &str) -> &str {
     p.trim_end_matches('/').rsplit('/').next().unwrap_or(p)
+}
+
+/// Lookup key for a downloaded file, so `./x.sh` and `x.sh` match.
+fn download_key(p: &str) -> String {
+    tidy_path(p.strip_prefix("./").unwrap_or(p))
 }
 
 fn tidy_path(s: &str) -> String {

