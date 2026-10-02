@@ -373,12 +373,9 @@ fn cli(args: &[&str], stdin: &str) -> (i32, String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stdin.as_bytes())
-        .unwrap();
+    // The program may exit before reading stdin (e.g. a usage error); the
+    // exit code is what's under test, so a closed pipe here isn't a failure.
+    let _ = child.stdin.take().unwrap().write_all(stdin.as_bytes());
     let out = child.wait_with_output().unwrap();
     (
         out.status.code().unwrap_or(-1),

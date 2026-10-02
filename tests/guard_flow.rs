@@ -236,12 +236,9 @@ fn hook_rewrite_json_is_valid() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
+    // The program may exit before reading stdin (e.g. a usage error); the
+    // exit code is what's under test, so a closed pipe here isn't a failure.
+    let _ = child.stdin.take().unwrap().write_all(input.as_bytes());
     let out = child.wait_with_output().unwrap();
     let _ = server.kill();
     assert_eq!(

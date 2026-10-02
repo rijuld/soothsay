@@ -100,7 +100,9 @@ fn perf_hook_pass_through() {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        child.stdin.take().unwrap().write_all(input).unwrap();
+        // The program may exit before reading stdin (e.g. a usage error); the
+        // exit code is what's under test, so a closed pipe here isn't a failure.
+        let _ = child.stdin.take().unwrap().write_all(input);
         let status = child.wait().unwrap();
         times.push(start.elapsed());
         assert_eq!(status.code(), Some(0), "a benign command must pass");

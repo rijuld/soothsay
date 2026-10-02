@@ -101,12 +101,9 @@ fn cli(args: &[&str], stdin: &str) -> i32 {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stdin.as_bytes())
-        .unwrap();
+    // The program may exit before reading stdin (e.g. a usage error); the
+    // exit code is what's under test, so a closed pipe here isn't a failure.
+    let _ = child.stdin.take().unwrap().write_all(stdin.as_bytes());
     child.wait().unwrap().code().unwrap_or(-1)
 }
 

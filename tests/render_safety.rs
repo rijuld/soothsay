@@ -14,7 +14,9 @@ fn cli(args: &[&str], stdin: &[u8]) -> (i32, Vec<u8>) {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(stdin).unwrap();
+    // The program may exit before reading stdin (e.g. a usage error); the
+    // exit code is what's under test, so a closed pipe here isn't a failure.
+    let _ = child.stdin.take().unwrap().write_all(stdin);
     let out = child.wait_with_output().unwrap();
     (out.status.code().unwrap_or(-1), out.stdout)
 }
