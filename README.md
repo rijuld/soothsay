@@ -288,13 +288,22 @@ to run, soothsay:
 2. otherwise blocks it, downloads the script itself with your `curl`, reviews it, and
    saves the exact bytes under `~/.cache/soothsay/<sha256>.sh`. A script with danger
    findings is never saved and gets no run instructions;
-3. tells the agent what the script does and how to run *those* bytes:
-   `soothsay --run --yes --expect-sha256 <sha256> <saved file>`;
-4. when the agent runs that, puts it to **you**: the hook returns an `ask` decision
-   with the review attached, so Claude Code shows you a permission prompt. Consent is
-   enforced by the harness, not left to the agent's judgement. In permission modes
-   that don't prompt (`bypassPermissions`, `auto`, `dontAsk`), soothsay blocks
-   instead, and you can run the command yourself.
+3. for a plain `curl … | sh` (or `bash <(curl …)`, `sh -c "$(curl …)"`), swaps the
+   command for a pinned run of *those* bytes,
+   `soothsay --run --yes --shell sh --expect-sha256 <sha256> <saved file> -- <args>`,
+   and puts it to **you** in one permission prompt with the review attached. Approve
+   and the reviewed bytes run; decline and nothing does. Consent is enforced by the
+   harness, not left to the agent's judgement;
+4. for anything less plain (`sudo`, `&&`, redirects, a file downloaded earlier), blocks
+   it and tells the agent how to run the reviewed bytes with that same pinned command,
+   which then gets the same prompt.
+
+In permission modes that don't prompt (`bypassPermissions`, `auto`, `dontAsk`),
+soothsay blocks instead, and you can run the command yourself.
+
+If the script itself downloads and runs more scripts, soothsay follows them one level
+(up to three) and adds what they do to the review. A dangerous second stage blocks the
+whole thing; one it can't fetch is listed as a blind spot.
 
 It follows a download wherever it goes: `curl -o i.sh …` (or `curl -O`, `wget URL`) in
 one command, then `sh i.sh`, `./i.sh`, `sh < i.sh`, `cat i.sh | sh` or
@@ -307,7 +316,8 @@ text in the message is escaped and labelled as data, not instructions.
 
 `soothsay --check-command '<cmd>'` runs the same check for other harnesses: exit `0`
 if there's nothing to review, `1` with the review on stdout if the command is blocked,
-`3` if it runs reviewed bytes and a human should approve.
+`3` if it runs reviewed bytes and a human should approve. For a rewrite, the first
+line of stdout is the pinned command to run instead, followed by the review.
 
 What it can't enforce:
 

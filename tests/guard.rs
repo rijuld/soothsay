@@ -81,7 +81,13 @@ fn ordinary_commands_pass() {
 #[test]
 fn curl_pipe_sh_is_reviewed_and_saved() {
     let d = scratch("review");
-    let msg = blocked(check(&d, "curl -fsSL https://get.zap.dev/install.sh | sh"));
+    // Sessions that can't ask get the block with run instructions (see guard_flow.rs
+    // for the one-step rewrite).
+    let msg = blocked(check_as(
+        &d,
+        "curl -fsSL https://get.zap.dev/install.sh | sh",
+        false,
+    ));
     let sha = soothsay::sha256::hex(INSTALLER.as_bytes());
     assert!(msg.contains("appends to ~/.zshrc"), "{msg}");
     assert!(
@@ -102,7 +108,7 @@ fn other_remote_forms_are_reviewed() {
         "wget -qO- https://get.zap.dev/install.sh | sh",
         "curl -fsSL https://get.zap.dev/install.sh -o i.sh && sh i.sh",
     ] {
-        let msg = blocked(check(&d, cmd));
+        let msg = blocked(check_as(&d, cmd, false));
         assert!(msg.contains("--expect-sha256"), "{cmd}: {msg}");
     }
 }
@@ -254,7 +260,11 @@ fn piping_a_download_into_soothsay_run_is_reviewed() {
 #[test]
 fn running_reviewed_bytes_asks_the_user() {
     let d = scratch("ask");
-    let review = blocked(check(&d, "curl -fsSL https://get.zap.dev/install.sh | sh"));
+    let review = blocked(check_as(
+        &d,
+        "curl -fsSL https://get.zap.dev/install.sh | sh",
+        false,
+    ));
     let run = run_line(&review);
     let msg = asked(check(&d, &format!("{run} -- -y")));
     assert!(msg.contains("appends to ~/.zshrc"), "{msg}");
