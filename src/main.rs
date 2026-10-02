@@ -12,6 +12,8 @@ soothsay: read the omens before you `curl | sh`
 USAGE
     curl -fsSL https://example.com/install.sh | soothsay [OPTIONS]
     soothsay [OPTIONS] install.sh
+    soothsay [OPTIONS] https://example.com/install.sh
+    soothsay --diff OLD NEW       (files or URLs)
     soothsay --check-command '<shell command>'
     soothsay hook                 (Claude Code PreToolUse hook; JSON on stdin)
 
@@ -39,6 +41,12 @@ OPTIONS
                            Let --deny / --fail-on skip findings in functions
                            that look never-called (off by default: a script
                            can hide how it calls them)
+        --diff <OLD> <NEW> Show what changed in behaviour between two versions of
+                           a script (files or URLs): findings, files and URLs
+                           added or removed, verdict. Exit 0 if behaviour is the
+                           same, 1 if it changed. Works with --json.
+        --cloak-check      With a URL: download it as curl and as a browser and
+                           compare. Exit 1 if the server sends different scripts
         --categories       List category ids and exit
         --no-color         Disable colour (also honours NO_COLOR)
     -h, --help             Show this help
@@ -66,6 +74,7 @@ EXIT STATUS
     0  report printed (and, with --run, the script's own exit status)
     1  a --deny / --fail-on policy matched
     1  --expect-sha256 did not match
+    1  --diff found a behaviour change, or --cloak-check found different bytes
     2  usage or I/O error, or input that isn't a shell script
        (empty, HTML, binary, or over 16 MiB)
 ";
@@ -82,6 +91,8 @@ struct Args {
     fail_on: Option<Severity>,
     ignore_unreachable: bool,
     allow_danger: bool,
+    cloak_check: bool,
+    diff: Option<(String, String)>,
     color: bool,
     script_args: Vec<String>,
 }
@@ -108,6 +119,8 @@ fn parse_args() -> Args {
         fail_on: None,
         ignore_unreachable: false,
         allow_danger: false,
+        cloak_check: false,
+        diff: None,
         color: std::env::var_os("NO_COLOR").is_none() && io::stdout().is_terminal(),
         script_args: Vec::new(),
     };
@@ -145,6 +158,14 @@ fn parse_args() -> Args {
             "--no-color" => a.color = false,
             "--ignore-unreachable" => a.ignore_unreachable = true,
             "--allow-danger" => a.allow_danger = true,
+            "--cloak-check" => a.cloak_check = true,
+            "--diff" => {
+                let old = value("--diff");
+                let new = it
+                    .next()
+                    .unwrap_or_else(|| die("--diff needs two scripts: --diff OLD NEW"));
+                a.diff = Some((old, new));
+            }
             "--shell" => a.shell = Some(value("--shell")),
             "--expect-sha256" => {
                 let v = value("--expect-sha256").to_ascii_lowercase();
@@ -222,28 +243,19 @@ fn main() {
     }
     let args = parse_args();
 
-    let (source, bytes) = match args.file.as_deref() {
-        None | Some("-") => {
-            if io::stdin().is_terminal() {
-                eprint!("{HELP}");
-                process::exit(2);
-            }
-            let buf =
-                read_capped(io::stdin()).unwrap_or_else(|e| die(&format!("reading stdin: {e}")));
-            ("stdin".to_string(), buf)
+    if let Some((old, new)) = &args.diff {
+        if args.file.is_some() || args.run {
+            die("--diff takes exactly two scripts and can't be combined with --run");
         }
-        Some(path) => {
-            let buf = File::open(path)
-                .and_then(read_capped)
-                .unwrap_or_else(|e| die(&format!("{path}: {e}")));
-            (path.rsplit('/').next().unwrap_or(path).to_string(), buf)
-        }
-    };
-    if bytes.len() as u64 > MAX_INPUT {
-        die("input is over 16 MiB; that's not an install script, refusing to read it");
+        diff_cmd(old, new, &args);
     }
-    if let Some(why) = guard::not_a_script(&bytes) {
-        die(why);
+    if args.cloak_check && !args.file.as_deref().is_some_and(is_url) {
+        die("--cloak-check needs a URL: soothsay --cloak-check https://example.com/install.sh");
+    }
+
+    let (source, bytes) = load(args.file.as_deref());
+    if args.cloak_check {
+        cloak_check(args.file.as_deref().unwrap_or_default(), &bytes, &args);
     }
     let report = soothsay::analyze_bytes(&bytes);
     if let Some(want) = &args.expect_sha256 {
@@ -392,6 +404,122 @@ fn run(bytes: &[u8], sha: &str, shell: &str, args: &Args) -> i32 {
     }
 }
 
+fn is_url(s: &str) -> bool {
+    s.starts_with("https://") || s.starts_with("http://")
+}
+
+/// The script to analyze, from stdin, a file or a URL, with the name to show
+/// for it. Exits with status 2 on anything that isn't a readable shell script.
+fn load(spec: Option<&str>) -> (String, Vec<u8>) {
+    let (source, bytes) = match spec {
+        None | Some("-") => {
+            if io::stdin().is_terminal() {
+                eprint!("{HELP}");
+                process::exit(2);
+            }
+            let buf =
+                read_capped(io::stdin()).unwrap_or_else(|e| die(&format!("reading stdin: {e}")));
+            ("stdin".to_string(), buf)
+        }
+        Some(url) if is_url(url) => {
+            if url.starts_with("http://") {
+                eprintln!(
+                    "soothsay: note: {} is plain HTTP, so anyone on the network path can change \
+                     what you download",
+                    render::clean(url)
+                );
+            }
+            let buf = fetch(url)
+                .unwrap_or_else(|e| die(&format!("couldn't download {}: {e}", render::clean(url))));
+            (render::clean(url), buf)
+        }
+        Some(path) => {
+            let buf = File::open(path)
+                .and_then(read_capped)
+                .unwrap_or_else(|e| die(&format!("{path}: {e}")));
+            (path.rsplit('/').next().unwrap_or(path).to_string(), buf)
+        }
+    };
+    if bytes.len() as u64 > MAX_INPUT {
+        die("input is over 16 MiB; that's not an install script, refusing to read it");
+    }
+    if let Some(why) = guard::not_a_script(&bytes) {
+        die(&format!("{source}: {why}"));
+    }
+    (source, bytes)
+}
+
+/// `--diff OLD NEW`: compare two versions of a script by behaviour.
+fn diff_cmd(old: &str, new: &str, args: &Args) -> ! {
+    if old == "-" && new == "-" {
+        die("--diff can read at most one script from stdin");
+    }
+    let (old_name, old_bytes) = load(Some(old));
+    let (new_name, new_bytes) = load(Some(new));
+    let d = soothsay::diff::compare(
+        &soothsay::analyze_bytes(&old_bytes),
+        &soothsay::analyze_bytes(&new_bytes),
+    );
+    if args.json {
+        print!("{}", soothsay::diff::json(&d, &old_name, &new_name));
+    } else {
+        print!(
+            "{}",
+            soothsay::diff::text(&d, &old_name, &new_name, args.color)
+        );
+    }
+    process::exit(i32::from(d.changed()));
+}
+
+/// A desktop browser's User-Agent, for asking a server what it shows people
+/// who look at a script before they pipe it into a shell.
+const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+                          (KHTML, like Gecko) Chrome/128.0 Safari/537.36";
+
+/// `--cloak-check`: does the server send `curl` a different script than a
+/// browser? `as_curl` is what was already downloaded with curl's own agent.
+/// Same bytes: say so and carry on with the report. Different: show both
+/// hashes and what the difference does, and exit 1.
+fn cloak_check(url: &str, as_curl: &[u8], args: &Args) {
+    let shown = render::clean(url);
+    let as_browser = fetch_as(url, Some(BROWSER_UA))
+        .unwrap_or_else(|e| die(&format!("couldn't download {shown} as a browser: {e}")));
+    let curl_sha = soothsay::sha256::hex(as_curl);
+    let browser_sha = soothsay::sha256::hex(&as_browser);
+    if curl_sha == browser_sha {
+        eprintln!(
+            "soothsay: cloak check passed: {shown} sends curl and a browser the same bytes \
+             (sha256 {})",
+            &curl_sha[..12]
+        );
+        return;
+    }
+    eprintln!(
+        "\nsoothsay: WARNING: the server sends a different script to curl than to a browser.\n\
+         \x20 as curl:    sha256 {curl_sha}\n\
+         \x20 as browser: sha256 {browser_sha}\n\
+         What you'd read in a browser is not what `curl | sh` would run. Below is what \
+         changes (browser → curl)."
+    );
+    let browser_report = if guard::not_a_script(&as_browser).is_some() {
+        soothsay::analyze("")
+    } else {
+        soothsay::analyze_bytes(&as_browser)
+    };
+    let d = soothsay::diff::compare(&browser_report, &soothsay::analyze_bytes(as_curl));
+    let browser_name = format!("{shown} (as browser)");
+    let curl_name = format!("{shown} (as curl)");
+    if args.json {
+        print!("{}", soothsay::diff::json(&d, &browser_name, &curl_name));
+    } else {
+        print!(
+            "{}",
+            soothsay::diff::text(&d, &browser_name, &curl_name, args.color)
+        );
+    }
+    process::exit(1);
+}
+
 /// Read at most one byte past [`MAX_INPUT`], so oversize input is detected
 /// without buffering all of it.
 fn read_capped(r: impl Read) -> io::Result<Vec<u8>> {
@@ -439,20 +567,28 @@ fn check(command: &str, cwd: PathBuf, can_ask: bool) -> Decision {
 /// would have used, so a server that cloaks by user agent serves us the same
 /// bytes.
 fn fetch(url: &str) -> Result<Vec<u8>, String> {
-    let mut child = process::Command::new("curl")
-        .args([
-            "-fsSL",
-            "--proto",
-            "=https,http",
-            "--connect-timeout",
-            "10",
-            "--max-time",
-            "30",
-            "--max-filesize",
-            "16777216",
-            "--",
-            url,
-        ])
+    fetch_as(url, None)
+}
+
+/// [`fetch`], optionally sending a different User-Agent than curl's own.
+fn fetch_as(url: &str, user_agent: Option<&str>) -> Result<Vec<u8>, String> {
+    let mut cmd = process::Command::new("curl");
+    cmd.args([
+        "-fsSL",
+        "--proto",
+        "=https,http",
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        "30",
+        "--max-filesize",
+        "16777216",
+    ]);
+    if let Some(ua) = user_agent {
+        cmd.args(["-A", ua]);
+    }
+    let mut child = cmd
+        .args(["--", url])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
