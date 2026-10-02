@@ -574,17 +574,28 @@ fn fetch(url: &str) -> Result<Vec<u8>, String> {
     fetch_as(url, None)
 }
 
+/// Package-registry lookups (`npx`/`uvx` checks) answer in well under a
+/// second; a hung registry must not stall the agent's command for long.
+const REGISTRIES: &[&str] = &[
+    "https://registry.npmjs.org/",
+    "https://api.npmjs.org/",
+    "https://pypi.org/",
+    "https://pypistats.org/",
+];
+
 /// [`fetch`], optionally sending a different User-Agent than curl's own.
 fn fetch_as(url: &str, user_agent: Option<&str>) -> Result<Vec<u8>, String> {
+    let registry = REGISTRIES.iter().any(|r| url.starts_with(r));
+    let (connect, total) = if registry { ("3", "8") } else { ("10", "30") };
     let mut cmd = process::Command::new("curl");
     cmd.args([
         "-fsSL",
         "--proto",
         "=https,http",
         "--connect-timeout",
-        "10",
+        connect,
         "--max-time",
-        "30",
+        total,
         "--max-filesize",
         "16777216",
     ]);

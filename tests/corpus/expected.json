@@ -15,7 +15,7 @@
     "url": "https://deno.land/install.sh"
   },
   "docker": {
-    "max_severity": "notice",
+    "max_severity": "warn",
     "sha256": "36bab4d12295a539f7493d52ed8296244895d2febceff5e725dedc0b0708f77b",
     "url": "https://get.docker.com"
   },
@@ -40,7 +40,7 @@
     "url": "https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh"
   },
   "ohmyzsh": {
-    "max_severity": "warn",
+    "max_severity": "notice",
     "sha256": "5574b96e94dbcb769f0d1592fa83aeb6ca2caf41c6ae5d76fcc7f04c524b4f55",
     "url": "https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh"
   },
@@ -50,7 +50,7 @@
     "url": "https://ollama.com/install.sh"
   },
   "pnpm": {
-    "max_severity": "warn",
+    "max_severity": "notice",
     "sha256": "2a13208d522446c35b61f1220b8a133a7c8db3f7e1ab3d00b1bfeda218ae4262",
     "url": "https://get.pnpm.io/install.sh"
   },

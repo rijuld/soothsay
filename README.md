@@ -354,19 +354,27 @@ Severities: **danger** (✖) · **warn** (▲) · **notice** (●) · **info** (
 ### What popular installers do
 
 This is a neutral snapshot, not a ranking. Most of what installers do is exactly what
-you asked for; the point is to *know*. Counts are live findings at notice level or
-above, from scripts fetched on 2026-09-28.
+you asked for; the point is to *know*. Verdicts are from scripts fetched on 2026-10-02.
+A [weekly CI job](.github/workflows/installers.yml) re-checks all of these and opens an
+issue when an installer's behaviour changes.
 
-| Installer | Lines | Highest | What stands out |
+| Installer | Lines | Verdict | What stands out |
 | --- | ---: | --- | --- |
 | Bun | 326 | notice | edits 3 shell profiles; runs the binary it installed |
-| Claude Code | 260 | notice | hands off to the downloaded `claude install` binary |
+| Claude Code | 260 | notice | hands off to the downloaded `claude` binary |
 | Deno | 116 | notice | runs the installed `deno` to finish setup |
-| nvm | 495 | notice | appends 2 lines to the profile `nvm_detect_profile` picks |
+| fnm | 237 | notice | `brew install fnm`, or appends to `~/.zshrc` |
+| Homebrew | 1,243 | notice | many `sudo` calls; writes `/etc/paths.d/homebrew` |
+| nvm | 495 | notice | appends to the profile `nvm_detect_profile` picks |
+| Oh My Zsh | 604 | notice | rewrites `~/.zshrc`; evals a runtime string |
+| pnpm | 619 | notice | runs the binary it downloaded to a temp dir |
 | rustup | 930 | notice | the real work happens inside `rustup-init`, a blind spot |
+| Starship | 554 | notice | extracts the release with `tar` as root |
 | uv | 2,191 | notice | edits shell profiles via `$_rcfile` |
-| Homebrew | 1,236 | warn | 26 `sudo` calls; overwrites `/etc/paths.d/homebrew` |
-| Ollama (Linux path) | 455 | warn | creates a system user, installs & enables a systemd service, writes apt sources |
+| Docker (get.docker.com) | 813 | warn | as root, adds an apt keyring and source, installs and enables `docker` |
+| k3s | 1,218 | warn | writes `/etc/rancher/k3s`; installs a systemd or OpenRC service |
+| Ollama (Linux) | 455 | warn | installs & enables a systemd service; writes apt sources and kernel modules |
+| Tailscale | 740 | warn | adds an apt/yum repo and keyring; enables `tailscaled` |
 
 Notice how often the answer is "then it runs a binary." That's the honest limit of
 reading a script, and soothsay says so instead of guessing.
