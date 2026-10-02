@@ -39,6 +39,24 @@ jobs:
             exit 1
           fi
 
+  # Speed is part of correctness: the hook runs on every Bash command an agent
+  # issues, and a hook that times out lets the command through. Budgets live in
+  # tests/perf.rs.
+  perf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # dtolnay/rust-toolchain has no version tags; this is the `stable` branch head.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Performance budgets
+        run: cargo test --release --locked --test perf -- --ignored --nocapture
+      - name: Long robustness run
+        env:
+          SOOTHSAY_ROBUSTNESS_ITERS: "200000"
+        run: cargo test --release --locked --test robustness
+
   msrv:
     runs-on: ubuntu-latest
     steps:

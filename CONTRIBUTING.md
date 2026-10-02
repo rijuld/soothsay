@@ -77,6 +77,46 @@ The flow for each command is:
   tests.
 - Security-relevant bypasses go through [SECURITY.md](SECURITY.md), not a public issue.
 
+### Fuzzing
+
+`tests/robustness.rs` throws a few hundred thousand random shell-shaped inputs, raw
+bytes and JSON fragments at the lexer, analyzer, renderer and hook JSON reader on
+every `cargo test`, with a fixed seed so failures reproduce. For a longer hunt:
+
+```sh
+SOOTHSAY_ROBUSTNESS_ITERS=500000 SOOTHSAY_ROBUSTNESS_SEED=7 cargo test --release --test robustness
+```
+
+`fuzz/` holds [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets for
+coverage-guided fuzzing (`analyze`, `lexer`, `json`). It needs nightly and runs weekly
+in CI ([`fuzz.yml`](.github/workflows/fuzz.yml)), which uploads any crashing input:
+
+```sh
+cargo install cargo-fuzz
+cd fuzz && cargo +nightly fuzz run analyze corpus/analyze -- -max_total_time=60
+```
+
+When a fuzzer finds a crash, minimize it (`cargo fuzz tmin`), fix it, and add the
+input as a regression test.
+
+### Performance budgets
+
+The hook runs on every Bash command an agent issues, so speed is part of
+correctness. `tests/perf.rs` holds the budgets, checked in release mode by CI:
+
+| Case | Budget |
+| --- | --- |
+| hook on an ordinary command (median of 30 runs) | < 10 ms |
+| 50k lines of system writes | < 1 s |
+| 30k lines of download-then-run | < 1 s |
+| 20k-deep nesting of `$(`, `${a:-`, `$((`, `{`, `(` | < 1 s each |
+
+```sh
+cargo test --release --test perf -- --ignored --nocapture
+```
+
+If your change trips a budget, fix the change rather than the budget.
+
 ## Ground rules
 
 - **No new dependencies** without a very good reason. Auditability is a feature.
