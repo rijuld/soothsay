@@ -23,6 +23,7 @@ pub mod diff;
 pub mod guard;
 pub mod json;
 pub mod lexer;
+pub mod packages;
 pub mod parse;
 pub mod render;
 pub mod sha256;
