@@ -254,6 +254,15 @@ impl Guard<'_> {
             ));
         }
 
+        // `npx -y pkg`, `uvx tool`, `pipx run pkg`: code from a package registry.
+        // Only commands that use a package runner touch the network here.
+        let runs =
+            crate::packages::runs(simples.iter().filter_map(|s| Some((s.name()?, s.rest()))));
+        match crate::packages::review(&runs, self.fetch, &self.cache, self.can_ask) {
+            None | Some(Decision::Pass) => {}
+            Some(d) => return d,
+        }
+
         let mut targets: Vec<Target> = Vec::new();
         let add_url = |targets: &mut Vec<Target>, u: &str| {
             if !targets
