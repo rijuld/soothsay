@@ -7,7 +7,9 @@
 //! bytes it reviewed, and tells the agent how to run *those* bytes with
 //! `soothsay --run --expect-sha256`. That run is then put to the user
 //! ([`Decision::Ask`]) with the review attached, so consent is enforced by the
-//! harness, not left to the agent. Dangerous scripts are never saved and never
+//! harness, not left to the agent. For a plain `curl … | sh` soothsay skips the
+//! second step: it rewrites the command into that pinned run and asks the user
+//! once ([`Decision::Rewrite`]). Dangerous scripts are never saved and never
 //! get run instructions.
 //!
 //! Anything soothsay can't review fails closed: an unresolvable URL, a failed
@@ -27,6 +29,9 @@ pub const MAX_SCRIPT: u64 = 16 * 1024 * 1024;
 
 /// At most this many scripts are fetched for one command.
 const MAX_TARGETS: usize = 3;
+
+/// At most this many scripts a reviewed script downloads are followed.
+const MAX_NESTED: usize = 3;
 
 /// Shells whose syntax soothsay actually understands.
 pub const KNOWN_SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "mksh", "ash"];
@@ -67,6 +72,11 @@ pub enum Decision {
     Pass,
     /// Runs reviewed bytes: let it run only if the user agrees, showing them this.
     Ask(String),
+    /// Replace the command with `command` (a pinned `soothsay --run` of the
+    /// bytes just reviewed) and let it run only if the user agrees, showing
+    /// them `reason`. `command` starts with the word `soothsay`; see
+    /// [`with_binary`] to point it at a specific executable.
+    Rewrite { command: String, reason: String },
     /// Block, with a message for whoever issued the command.
     Block(String),
 }
@@ -85,6 +95,27 @@ pub struct Guard<'a> {
     /// Whether the harness will really ask the user on [`Decision::Ask`]. When
     /// it won't (a permission mode that skips prompts), asks become blocks.
     pub can_ask: bool,
+}
+
+/// What reviewing one script produced.
+struct Reviewed {
+    /// The full message for a blocked command, with run instructions if safe.
+    text: String,
+    /// Where it came from, the findings and nested reviews, without any
+    /// instructions: what the user sees when approving a rewrite.
+    summary: Option<String>,
+    /// Set when the bytes are safe to offer and were saved: (sha256, path).
+    pinned: Option<(String, PathBuf)>,
+}
+
+impl Reviewed {
+    fn only(text: String) -> Self {
+        Reviewed {
+            text,
+            summary: None,
+            pinned: None,
+        }
+    }
 }
 
 /// Something the command runs that soothsay must read first.
@@ -389,7 +420,8 @@ impl Guard<'_> {
             ));
         }
         if !targets.is_empty() {
-            let mut out: Vec<String> = targets.iter().map(|t| self.review(t)).collect();
+            let reviews: Vec<Reviewed> = targets.iter().map(|t| self.review(t)).collect();
+            let mut out: Vec<String> = reviews.iter().map(|r| r.text.clone()).collect();
             // How the command fetches matters too: plain HTTP, TLS checks off.
             let transport: Vec<String> = cmd
                 .findings
@@ -397,11 +429,49 @@ impl Guard<'_> {
                 .filter(|f| f.category == Category::Network && f.severity >= Severity::Warn)
                 .map(|f| format!("  warn: {}", clean_line(&f.message)))
                 .collect();
-            if !transport.is_empty() {
-                out.push(format!(
-                    "About the command itself:\n{}",
-                    transport.join("\n")
-                ));
+            let about = (!transport.is_empty())
+                .then(|| format!("About the command itself:\n{}", transport.join("\n")));
+            if let Some(a) = &about {
+                out.push(a.clone());
+            }
+            // One script, safe, saved, and a plain `curl … | sh`: swap the
+            // command for a pinned run and ask once.
+            if let (
+                true,
+                [Target::Url(url)],
+                [Reviewed {
+                    summary: Some(summary),
+                    pinned: Some((sha, path)),
+                    ..
+                }],
+            ) = (self.can_ask, targets.as_slice(), reviews.as_slice())
+            {
+                if let Some((shell, args)) = rewritable(command) {
+                    let mut run = format!(
+                        "soothsay --run --yes --shell {shell} --expect-sha256 {sha} {}",
+                        shell_quote(&path.to_string_lossy())
+                    );
+                    if !args.is_empty() {
+                        let quoted: Vec<String> = args.iter().map(|a| shell_quote(a)).collect();
+                        run.push_str(&format!(" -- {}", quoted.join(" ")));
+                    }
+                    let mut reason = format!(
+                        "soothsay downloaded and read {} before running it.\n{summary}",
+                        clean_line(url)
+                    );
+                    if let Some(a) = &about {
+                        reason.push_str(&format!("\n{a}\n"));
+                    }
+                    reason.push_str(&format!(
+                        "\nApproving runs exactly the bytes soothsay read (sha256 {sha}), \
+                         saved at {}, instead of downloading them again.",
+                        path.display()
+                    ));
+                    return Decision::Rewrite {
+                        command: run,
+                        reason,
+                    };
+                }
             }
             return Decision::Block(out.join("\n\n"));
         }
@@ -485,17 +555,17 @@ impl Guard<'_> {
     }
 
     /// Fetch or read one script, review it, and keep a copy of safe bytes.
-    fn review(&self, t: &Target) -> String {
+    fn review(&self, t: &Target) -> Reviewed {
         let (bytes, origin) = match t {
             Target::Url(u) => match (self.fetch)(u) {
                 Ok(b) => (b, clean_line(u)),
                 Err(e) => {
-                    return format!(
+                    return Reviewed::only(format!(
                         "soothsay blocked this command: it runs {} but soothsay couldn't \
                          download it to review ({}). Failing closed.",
                         clean_line(u),
                         clean_line(&e)
-                    )
+                    ))
                 }
             },
             Target::File(p, u) => match read_capped(p) {
@@ -508,49 +578,128 @@ impl Guard<'_> {
                     ),
                 ),
                 Err(e) => {
-                    return format!(
+                    return Reviewed::only(format!(
                         "soothsay blocked this command: it runs {}, which was downloaded \
                          from {}, and soothsay couldn't read it ({e}). Failing closed.",
                         clean_line(&p.to_string_lossy()),
                         clean_line(u)
-                    )
+                    ))
                 }
             },
         };
         let r = match self.screen(&bytes, &origin) {
             Ok(r) => r,
-            Err(msg) => return msg,
+            Err(msg) => return Reviewed::only(msg),
         };
-        let mut s = format!(
-            "soothsay blocked this command: it runs {origin} without anyone reading it.\n\
-             soothsay read it instead: {} lines, sha256 {}.\n{}",
+        let (nested, nested_danger) = self.nested(&r);
+        let body = format!(
+            "{} lines, sha256 {}.\n{}{nested}",
             r.lines,
             r.sha256,
             findings_text(&r)
         );
-        if r.findings.iter().any(|f| f.severity == Severity::Danger) {
+        let dangerous = nested_danger || r.findings.iter().any(|f| f.severity == Severity::Danger);
+        let mut text = format!(
+            "soothsay blocked this command: it runs {origin} without anyone reading it.\n\
+             soothsay read it instead: {body}"
+        );
+        if dangerous {
             // Never saved, so there is nothing to hand to `soothsay --run`.
-            s.push_str("\nDon't run it. Show the user the DANGER lines above and let them decide.");
-            return s;
+            text.push('\n');
+            text.push_str(if nested_danger {
+                "Don't run it: a script it downloads and runs is dangerous. Show the user the \
+                 DANGER lines above and let them decide."
+            } else {
+                "Don't run it. Show the user the DANGER lines above and let them decide."
+            });
+            return Reviewed::only(text);
         }
         match self.save(&bytes, &r.sha256) {
-            Ok(path) => s.push_str(&format!(
-                "\nThe exact bytes soothsay reviewed are saved at {path}.\n\
-                 Tell the user what the script will do (above). To run exactly those bytes, \
-                 use the command below; soothsay will ask the user to approve it first:\n  \
-                 soothsay --run --yes --expect-sha256 {sha} {quoted}\n\
-                 (add `-- <args>` for installer arguments, e.g. `-- -y`).",
-                path = path.display(),
-                sha = r.sha256,
-                quoted = shell_quote(&path.to_string_lossy()),
-            )),
-            Err(e) => s.push_str(&format!(
-                "\nsoothsay couldn't save a copy ({}), so there's no safe way to run it \
-                 from here. Ask the user.",
-                clean_line(&e)
-            )),
+            Ok(path) => {
+                text.push_str(&format!(
+                    "\nThe exact bytes soothsay reviewed are saved at {path}.\n\
+                     Tell the user what the script will do (above). To run exactly those bytes, \
+                     use the command below; soothsay will ask the user to approve it first:\n  \
+                     soothsay --run --yes --expect-sha256 {sha} {quoted}\n\
+                     (add `-- <args>` for installer arguments, e.g. `-- -y`).",
+                    path = path.display(),
+                    sha = r.sha256,
+                    quoted = shell_quote(&path.to_string_lossy()),
+                ));
+                Reviewed {
+                    text,
+                    summary: Some(body),
+                    pinned: Some((r.sha256.clone(), path)),
+                }
+            }
+            Err(e) => {
+                text.push_str(&format!(
+                    "\nsoothsay couldn't save a copy ({}), so there's no safe way to run it \
+                     from here. Ask the user.",
+                    clean_line(&e)
+                ));
+                Reviewed::only(text)
+            }
         }
-        s
+    }
+
+    /// Scripts a reviewed script itself downloads and runs, followed one level:
+    /// the notes to append, and whether any of them is dangerous.
+    fn nested(&self, r: &Report) -> (String, bool) {
+        let mut urls: Vec<&str> = Vec::new();
+        for u in r.urls.iter().filter(|u| u.action == "run") {
+            if fetchable(&u.url) && !urls.contains(&u.url.as_str()) {
+                urls.push(&u.url);
+            }
+        }
+        if urls.is_empty() {
+            return (String::new(), false);
+        }
+        if urls.len() > MAX_NESTED {
+            return (
+                format!(
+                    "\nIt also downloads and runs {} more scripts; soothsay didn't follow \
+                     them (blind spots).\n",
+                    urls.len()
+                ),
+                false,
+            );
+        }
+        let mut out = String::new();
+        let mut danger = false;
+        for u in urls {
+            let shown = clean_line(u);
+            let bytes = match (self.fetch)(u) {
+                Ok(b) => b,
+                Err(e) => {
+                    out.push_str(&format!(
+                        "\nIt also downloads and runs {shown}, which soothsay couldn't fetch \
+                         ({}): a blind spot.\n",
+                        clean_line(&e)
+                    ));
+                    continue;
+                }
+            };
+            let nr = match self.screen(&bytes, &shown) {
+                Ok(nr) => nr,
+                Err(msg) => {
+                    out.push_str(&format!(
+                        "\nIt also downloads and runs {shown}, which soothsay can't review: \
+                         {}\n",
+                        msg.trim_start_matches("soothsay blocked this command: ")
+                    ));
+                    continue;
+                }
+            };
+            danger |= nr.findings.iter().any(|f| f.severity == Severity::Danger);
+            out.push_str(&format!(
+                "\nIt also downloads and runs {shown} ({} lines, sha256 {}):\n{}",
+                nr.lines,
+                nr.sha256,
+                indent(&findings_text(&nr))
+            ));
+        }
+        (out, danger)
     }
 
     fn save(&self, bytes: &[u8], sha: &str) -> Result<PathBuf, String> {
@@ -785,6 +934,106 @@ fn run_file<'a>(args: &[&'a str]) -> Option<&'a str> {
         return (a != "-").then_some(a);
     }
     None
+}
+
+/// The shell and installer arguments of a command that is *only* a download
+/// run by a shell, so it can be swapped for a pinned `soothsay --run`:
+/// `curl … URL | sh [-s] [-- args]`, `bash <(curl … URL)`, or
+/// `sh -c "$(curl … URL)"`. Anything with `sudo`, redirects, assignments,
+/// several commands or unresolved words isn't rewritten.
+fn rewritable(command: &str) -> Option<(String, Vec<String>)> {
+    if command.contains("sudo") || command.contains("doas") {
+        return None;
+    }
+    let top = crate::parse::parse(command, 0, None).commands;
+    if top.iter().any(|c| !c.redirects.is_empty()) {
+        return None;
+    }
+    let shell = |w: &Word| -> Option<String> {
+        let n = w.bare()?;
+        let n = base(&n).to_string();
+        KNOWN_SHELLS.contains(&n.as_str()).then_some(n)
+    };
+    // A single downloader with only literal words, e.g. `curl -fsSL https://x`.
+    let downloader = |c: &crate::parse::Command| -> bool {
+        c.redirects.is_empty()
+            && c.words.iter().all(|w| w.literal().is_some())
+            && c.words
+                .first()
+                .and_then(Word::bare)
+                .is_some_and(|n| DOWNLOADERS.contains(&base(&n)))
+    };
+    let plain_download = |src: &str| -> bool {
+        matches!(crate::parse::parse(src, 0, None).commands.as_slice(), [c] if downloader(c))
+    };
+    match top.as_slice() {
+        [dl, sh] if dl.pipeline == sh.pipeline && dl.stage == 0 && sh.stage == 1 => {
+            if !downloader(dl) {
+                return None;
+            }
+            let name = shell(sh.words.first()?)?;
+            let rest: Vec<String> = sh.words[1..]
+                .iter()
+                .map(Word::literal)
+                .collect::<Option<_>>()?;
+            let mut rest = rest.as_slice();
+            let reads_stdin = rest.first().is_some_and(|a| a == "-s");
+            if reads_stdin {
+                rest = &rest[1..];
+            }
+            match rest.split_first() {
+                Some((dd, after)) if dd == "--" => rest = after,
+                // `sh file`, `sh -x`: not a plain pipe of the download.
+                Some(_) if !reads_stdin => return None,
+                _ => {}
+            }
+            Some((name, rest.to_vec()))
+        }
+        [c] => {
+            let name = shell(c.words.first()?)?;
+            match &c.words[1..] {
+                // `bash <(curl …)`
+                [w] => match w.parts.as_slice() {
+                    [Part::ProcSubst { script, .. }] if plain_download(script) => {
+                        Some((name, Vec::new()))
+                    }
+                    _ => None,
+                },
+                // `sh -c "$(curl …)"`
+                [flag, w] if flag.bare().as_deref() == Some("-c") => match w.parts.as_slice() {
+                    [Part::Subst { script, .. }] if plain_download(script) => {
+                        Some((name, Vec::new()))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Point a [`Decision::Rewrite`] command at a specific `soothsay` executable,
+/// for harnesses whose shell may not have it on `PATH`.
+pub fn with_binary(command: &str, exe: &Path) -> String {
+    match command.strip_prefix("soothsay ") {
+        Some(rest) => format!("{} {rest}", shell_quote(&exe.to_string_lossy())),
+        None => command.to_string(),
+    }
+}
+
+fn indent(s: &str) -> String {
+    let lines: Vec<String> = s
+        .lines()
+        .map(|l| {
+            if l.is_empty() {
+                String::new()
+            } else {
+                format!("  {l}")
+            }
+        })
+        .collect();
+    lines.join("\n") + "\n"
 }
 
 fn fetchable(u: &str) -> bool {

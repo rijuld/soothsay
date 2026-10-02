@@ -216,6 +216,10 @@ fn main() {
                     println!("{msg}");
                     process::exit(3);
                 }
+                Decision::Rewrite { command, reason } => {
+                    println!("{}\n\n{reason}", rewritten(&command));
+                    process::exit(3);
+                }
             }
         }
         _ => {}
@@ -536,5 +540,25 @@ fn hook() -> ! {
             );
             process::exit(0);
         }
+        // Swap the command for a pinned run of the reviewed bytes, and ask.
+        Decision::Rewrite { command, reason } => {
+            println!(
+                "{{\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\",\
+                 \"permissionDecision\":\"ask\",\"permissionDecisionReason\":{},\
+                 \"updatedInput\":{{\"command\":{}}}}}}}",
+                render::json_str(&reason),
+                render::json_str(&rewritten(&command))
+            );
+            process::exit(0);
+        }
+    }
+}
+
+/// A rewritten command that runs this very binary, so it works even when
+/// `soothsay` isn't on the shell's `PATH`.
+fn rewritten(command: &str) -> String {
+    match std::env::current_exe() {
+        Ok(exe) => guard::with_binary(command, &exe),
+        Err(_) => command.to_string(),
     }
 }
