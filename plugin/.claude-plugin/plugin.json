@@ -1,7 +1,7 @@
 {
   "name": "soothsay",
   "displayName": "soothsay",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Read the omens before Claude runs curl | sh: blocks commands that run scripts from the network, reviews the script, pins the exact bytes, and asks you before they run.",
   "author": {
     "name": "rijuld",

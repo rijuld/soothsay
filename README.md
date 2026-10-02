@@ -142,10 +142,10 @@ Or use a prebuilt binary for macOS or Linux (x86_64 and arm64) from the
 the build attestation before you put it on your `PATH`:
 
 ```sh
-gh release download v0.1.0 --repo rijuld/soothsay -p SHA256SUMS -p '*aarch64-apple-darwin*'
+gh release download v0.2.0 --repo rijuld/soothsay -p SHA256SUMS -p '*aarch64-apple-darwin*'
 sha256sum -c SHA256SUMS --ignore-missing
-gh attestation verify soothsay-v0.1.0-aarch64-apple-darwin.tar.gz --repo rijuld/soothsay
-tar xzf soothsay-v0.1.0-aarch64-apple-darwin.tar.gz
+gh attestation verify soothsay-v0.2.0-aarch64-apple-darwin.tar.gz --repo rijuld/soothsay
+tar xzf soothsay-v0.2.0-aarch64-apple-darwin.tar.gz
 ```
 
 It's a single small binary with **zero dependencies**. That's on purpose: a tool you
@@ -226,7 +226,7 @@ If you maintain an `install.sh`, soothsay can keep it honest across PRs:
 ```yaml
 # .github/workflows/installer.yml
 # Pin a version. Never install a security tool from a moving branch.
-- run: cargo install --locked soothsay --version 0.1.0
+- run: cargo install --locked soothsay --version 0.2.0
 - run: soothsay --deny persistence,remote-exec,obfuscation --fail-on danger install.sh
 ```
 
