@@ -162,15 +162,48 @@ proving the binaries were built from this repo by its release workflow.
 # Pipe a script in
 curl -fsSL https://example.com/install.sh | soothsay
 
-# Or point it at a file
+# Or point it at a file, or straight at the URL
 soothsay ./install.sh
+soothsay https://bun.sh/install
 
 # Everything, including low-level notes and uncapped lists
 soothsay -v install.sh
 
 # Read the report, then decide, then run *exactly the bytes you just read*
 curl -fsSL https://sh.rustup.rs | soothsay --run -- -y
+
+# What changed in an installer's behaviour since the version you last reviewed?
+soothsay --diff install-v1.sh https://example.com/install.sh
+
+# Does the server send curl a different script than it shows a browser?
+soothsay --cloak-check https://example.com/install.sh
 ```
+
+### `--diff`: what changed in behaviour, not in text
+
+Installers get reformatted all the time, and a text diff of a 2,000-line script tells
+you nothing. `--diff OLD NEW` (files or URLs) compares what the two versions *do*:
+findings, files and URLs added or removed, ignoring line numbers, plus the verdict.
+
+```text
+  BEHAVIOUR
+  + appends to ~/.zshrc  (● notice · rc-edit · L2)
+  + pipes https://x.dev/i.sh straight into sh  (▲ warn · remote-exec · L3)
+  - installs packages with brew: jq  (● notice · packages · L1)
+```
+
+It exits `1` when behaviour changed and `0` when it didn't, so CI can watch an installer
+you depend on: keep the copy you reviewed in the repo and run
+`soothsay --diff vendor/install.sh https://example.com/install.sh` on a schedule.
+`--json` gives a machine-readable diff.
+
+### `--cloak-check`: is the server telling everyone the same story?
+
+A server can tell `curl` apart from a browser and
+[serve a different script to a pipe](https://www.idontplaydarts.com/2016/04/detecting-curl-pipe-bash-server-side/).
+`--cloak-check URL` downloads the script both ways and compares the hashes. If they
+differ, it prints both and a behaviour diff (browser → curl) and exits `1`. If they
+match, it says so and prints the normal report.
 
 ### `--run`: review, then run the bytes you reviewed
 
@@ -207,6 +240,8 @@ If you maintain an `install.sh`, soothsay can keep it honest across PRs:
 | `--run [-y]` | run the analyzed bytes after confirming (or with `-y`, without asking) |
 | `--allow-danger` | with `--run -y`: run even with danger findings (otherwise it refuses, exit `1`) |
 | `--shell <sh>` | interpreter for `--run` (default: the shebang, else `sh`) |
+| `--diff <old> <new>` | behaviour diff of two scripts (files or URLs); exit `1` if it changed |
+| `--cloak-check` | with a URL: fetch as curl and as a browser; exit `1` if the bytes differ |
 | `--no-color` | plain output (also honours `NO_COLOR`; colour is off when piped) |
 
 Exit codes: `0` ok · `1` policy matched · `2` usage or I/O error, or input that isn't a
@@ -417,14 +452,11 @@ Good first issues are marked 🌱.
   (supply-chain redirects)
 - 🌱 A `--markdown` renderer for pasting reports into PRs
 - 🌱 Shell completions
-- `--diff old.sh new.sh`: what *changed* in an installer's behaviour between versions
 - Follow `curl … -o x.sh; sh x.sh` within the same script (analyze the file it runs when
   its URL is known)
 - A small constant-propagation pass so `for f in a b; do … "$f"` resolves
 - Hook mode: when the user approves, rewrite the agent's command to the pinned
   `soothsay --run` call (`updatedInput`) instead of asking the agent to retype it
-- Cloaking detection: fetch the script as `curl` and as a browser and compare hashes,
-  since servers can serve a different script to a pipe
 
 ## License
 

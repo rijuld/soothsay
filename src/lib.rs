@@ -19,6 +19,7 @@
 //! downloads and runs is listed as a *blind spot* rather than guessed at.
 
 pub mod analyze;
+pub mod diff;
 pub mod guard;
 pub mod json;
 pub mod lexer;
