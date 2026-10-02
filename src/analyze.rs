@@ -634,6 +634,11 @@ struct Analyzer {
     sudo_wrappers: HashSet<String>,
     arrays: HashMap<String, Vec<String>>,
     depth: usize,
+    /// Inside `sudo sh -c '…'` (or `$sh_c '…'` holding it): this code runs as root.
+    root_code: usize,
+    /// Variables the script tests for emptiness (`[ -n "$X" ]`), so a delete
+    /// under `$X/…` elsewhere is probably guarded.
+    guarded: HashSet<String>,
     /// Dedup indexes into `findings` / `files`, so big scripts stay linear.
     /// An entry is only trusted if the index still holds a matching item,
     /// since `findings` can be truncated.
@@ -782,6 +787,35 @@ impl Analyzer {
         vec![self.resolve(w)]
     }
 
+    /// `$sh_c` where `sh_c` is `sh -c`, `sudo -E sh -c` or `su -c` (Docker's
+    /// installer does this): the shell to run the next word with, and whether
+    /// any of its values runs it as root. Dry-run values like `echo` are ignored.
+    fn shell_runner(&self, w: &Word) -> Option<(String, bool)> {
+        let [Part::Param { name, .. }] = w.parts.as_slice() else {
+            return None;
+        };
+        if w.quoted {
+            return None;
+        }
+        let vals: Vec<&String> = match self.ever.get(name) {
+            Some(v) => v.iter().collect(),
+            None => self.vars.get(name).into_iter().collect(),
+        };
+        let mut found: Option<(String, bool)> = None;
+        for v in vals {
+            let t: Vec<&str> = v.split_whitespace().collect();
+            if t.is_empty() || matches!(t[0], "echo" | "true" | ":" | "printf") {
+                continue; // a dry run prints the command instead of running it
+            }
+            let (shell, root) = runner_value(&t)?;
+            found = Some(match found {
+                Some((s0, r0)) => (s0, r0 || root),
+                None => (shell, root),
+            });
+        }
+        found
+    }
+
     fn could_be_sudo(&self, w: &Word) -> bool {
         if let [Part::Param { name, .. }] = w.parts.as_slice() {
             let lower = name.to_ascii_lowercase();
@@ -805,8 +839,26 @@ impl Analyzer {
         }
         let mut h = Head::default();
         for w in &words[k..] {
+            if h.args.is_empty() {
+                if let Some((shell, root)) = self.shell_runner(w) {
+                    h.as_root |= root;
+                    for t in [shell.as_str(), "-c"] {
+                        h.args.push(t.to_string());
+                        h.words.push(Word {
+                            parts: vec![Part::Lit(t.to_string())],
+                            quoted: false,
+                        });
+                    }
+                    continue;
+                }
+            }
             if self.could_be_sudo(w) && h.args.is_empty() {
                 h.as_root = true;
+                h.args.push("sudo".into());
+                h.words.push(Word {
+                    parts: vec![Part::Lit("sudo".into())],
+                    quoted: false,
+                });
                 continue;
             }
             let text = self.resolve(w);
@@ -855,22 +907,29 @@ impl Analyzer {
                 "sudo" | "doas" | "run0" | "pkexec" => {
                     h.as_root = true;
                     take(&mut h, 1);
+                    // A bare `sudo`, `sudo -n` or `sudo -k` runs nothing.
+                    let mut check = h.args.is_empty();
                     while h.args.first().is_some_and(|a| a.starts_with('-')) {
                         let f = h.args[0].clone();
+                        // `sudo -v`, `sudo -l [cmd]`, `sudo -K` check or reset access;
+                        // they never run a command. (`-n`, `-k`, `-A`, `-E` only
+                        // change how the command that follows is run.)
                         if matches!(
                             f.as_str(),
-                            "-l" | "-v"
-                                | "-k"
+                            "-v" | "-l"
+                                | "-ll"
                                 | "-K"
-                                | "-n"
-                                | "--list"
                                 | "--validate"
-                                | "--reset-timestamp"
-                        ) && h.args.len() <= 2
+                                | "--list"
+                                | "--remove-timestamp"
+                        ) || (f.len() > 2
+                            && !f.starts_with("--")
+                            && f[1..].chars().any(|c| matches!(c, 'v' | 'l' | 'K')))
                         {
-                            return None; // `sudo -v` / `sudo -l cmd` check access, they don't run anything
+                            return None;
                         }
                         take(&mut h, 1);
+                        check = h.args.is_empty();
                         if matches!(
                             f.as_str(),
                             "-u" | "-g" | "-C" | "-D" | "-h" | "-p" | "-r" | "-t" | "-U" | "--user"
@@ -880,6 +939,9 @@ impl Analyzer {
                         if f == "--" {
                             break;
                         }
+                    }
+                    if check {
+                        return None;
                     }
                 }
                 "env" => {
@@ -953,6 +1015,7 @@ impl Analyzer {
                 h.name = tool.to_string();
             }
         }
+        h.as_root |= self.root_code > 0;
         Some(h)
     }
 
@@ -990,6 +1053,18 @@ impl Analyzer {
             }
             self.redirects(cmd, None, group, idx);
             return;
+        }
+
+        // `[ -n "$X" ]` / `[ -z "$X" ]`: the script checks whether X is empty.
+        let test = cmd.words.first().and_then(Word::bare);
+        if matches!(test.as_deref(), Some("[" | "[[" | "test")) {
+            for pair in cmd.words.windows(2) {
+                if matches!(pair[0].bare().as_deref(), Some("-n" | "-z")) {
+                    if let [Part::Param { name, .. }] = pair[1].parts.as_slice() {
+                        self.guarded.insert(name.clone());
+                    }
+                }
+            }
         }
 
         let Some(h) = self.head(&cmd.words) else {
@@ -2318,7 +2393,11 @@ impl Analyzer {
         }
         if let Some(code) = h.value(&["-c", "-e", "--eval"]) {
             if SHELLS.contains(&n) {
+                // `sudo sh -c '…'`: everything inside runs as root too.
+                let root = usize::from(ctx.as_root);
+                self.root_code += root;
                 self.nested(&code, ctx.line, ctx.function);
+                self.root_code -= root;
             } else {
                 self.add(
                     Category::BlindSpot,
@@ -2593,9 +2672,14 @@ impl Analyzer {
                 );
             } else if recursive && t.starts_with("${") && !t.contains(":-") {
                 let var = t.trim_start_matches("${").split('}').next().unwrap_or("");
+                let sev = if self.empty_var_is_unlikely(var, &t, ctx) {
+                    Severity::Info
+                } else {
+                    Severity::Warn
+                };
                 self.add(
                     Category::Destructive,
-                    Severity::Warn,
+                    sev,
                     ctx,
                     format!("rm -r on {t}: if ${var} is ever empty this deletes from /"),
                     Some(h.line()),
@@ -2633,6 +2717,30 @@ impl Analyzer {
                 });
             }
         }
+    }
+
+    /// Whether an `rm -r "${var}…"` is probably safe from `$var` being empty:
+    /// a function argument with a subpath (`"$3/unpacked"`), a variable only
+    /// ever assigned non-empty values, or one the script tests with `-n`/`-z`.
+    /// A bare `"$var"`, `"$var/"` or `"$var/"*` stays a warning: empty, that's `/`.
+    fn empty_var_is_unlikely(&self, var: &str, path: &str, ctx: &Ctx) -> bool {
+        let rest = path
+            .strip_prefix("${")
+            .and_then(|p| p.strip_prefix(var))
+            .and_then(|p| p.strip_prefix('}'))
+            .unwrap_or("");
+        if matches!(rest, "" | "/" | "/*" | "*") {
+            return false;
+        }
+        let positional = var.chars().all(|c| c.is_ascii_digit()) || matches!(var, "@" | "*");
+        if positional {
+            return ctx.function.is_some();
+        }
+        self.guarded.contains(var)
+            || self
+                .ever
+                .get(var)
+                .is_some_and(|vals| !vals.is_empty() && vals.iter().all(|v| !v.trim().is_empty()))
     }
 
     fn chmod(&mut self, h: &Head, ctx: &Ctx) {
@@ -2824,6 +2932,38 @@ fn cron_commands(table: &str) -> String {
 
 fn assignment_text(l: &str) -> bool {
     l.split_once('=').is_some_and(|(n, _)| is_name(n))
+}
+
+/// `sudo -E sh -c`, `sh -c`, `su -c`, `doas bash -c`: (shell, as root), or
+/// `None` if the words aren't a shell-runner prefix.
+fn runner_value(t: &[&str]) -> Option<(String, bool)> {
+    let mut i = 0;
+    let mut root = false;
+    if matches!(t.first(), Some(&("sudo" | "doas"))) {
+        root = true;
+        i = 1;
+        while t.get(i).is_some_and(|a| a.starts_with('-')) {
+            i += if matches!(t[i], "-u" | "-g" | "-C") {
+                2
+            } else {
+                1
+            };
+        }
+    }
+    let prog = *t.get(i)?;
+    let rest = &t[i + 1..];
+    let su = basename(prog) == "su";
+    let ends_c = rest
+        .last()
+        .is_some_and(|a| a.starts_with('-') && !a.starts_with("--") && a.ends_with('c'));
+    if !ends_c || !rest.iter().all(|a| a.starts_with('-') || su) {
+        return None;
+    }
+    match basename(prog) {
+        "su" => Some(("sh".into(), true)),
+        s if SHELLS.contains(&s) => Some((s.to_string(), root)),
+        _ => None,
+    }
 }
 
 fn is_decoder(h: &Head) -> bool {
