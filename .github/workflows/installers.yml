@@ -1,0 +1,84 @@
+name: Installer watch
+
+# Runs soothsay over popular real-world installers (tests/corpus/installers.tsv).
+# On a push that touches the analyzer, a verdict that changed on unchanged
+# bytes is a soothsay regression and fails the job. On the weekly run, an
+# installer whose bytes *and* verdict changed upstream is reported in an issue.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/corpus/**"
+      - "scripts/installer_corpus.py"
+
+permissions:
+  contents: read
+
+jobs:
+  corpus:
+    runs-on: ubuntu-latest
+    outputs:
+      upstream: ${{ steps.check.outputs.upstream }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - run: cargo build --release --locked
+      - name: Check verdicts
+        id: check
+        run: |
+          python3 scripts/installer_corpus.py --check \
+            --json corpus.json --markdown corpus.md
+      - name: Report
+        if: always()
+        run: |
+          {
+            echo "## Installer watch"
+            echo
+            if [ -f corpus.md ]; then cat corpus.md; else echo "No report was produced."; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: installer-corpus
+          path: |
+            corpus.json
+            corpus.md
+          if-no-files-found: warn
+
+  file-issue:
+    needs: corpus
+    if: github.event_name == 'schedule' && needs.corpus.outputs.upstream != ''
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: installer-corpus
+      - name: Open or update the installer-watch issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CHANGED: ${{ needs.corpus.outputs.upstream }}
+        run: |
+          title="Installer watch: $(date -u +%Y-%m-%d)"
+          {
+            echo "These installers changed upstream, and soothsay's verdict changed with them: **${CHANGED}**."
+            echo
+            cat corpus.md
+            echo
+            echo "If the new verdict is right, run \`scripts/installer_corpus.py --update\` and commit \`tests/corpus/expected.json\`."
+          } > body.md
+          existing=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file body.md
+          else
+            gh issue create --title "$title" --body-file body.md
+          fi

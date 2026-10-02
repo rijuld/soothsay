@@ -1,0 +1,15 @@
+bun	https://bun.sh/install
+deno	https://deno.land/install.sh
+rustup	https://sh.rustup.rs
+uv	https://astral.sh/uv/install.sh
+nvm	https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh
+homebrew	https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh
+ollama	https://ollama.com/install.sh
+claude	https://claude.ai/install.sh
+ohmyzsh	https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh
+starship	https://starship.rs/install.sh
+pnpm	https://get.pnpm.io/install.sh
+docker	https://get.docker.com
+k3s	https://get.k3s.io
+tailscale	https://tailscale.com/install.sh
+fnm	https://fnm.vercel.app/install
