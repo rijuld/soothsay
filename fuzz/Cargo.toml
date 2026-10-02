@@ -1,0 +1,42 @@
+[package]
+name = "soothsay-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.soothsay]
+path = ".."
+
+# Keep this crate out of the main workspace: it needs nightly and libFuzzer.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "analyze"
+path = "fuzz_targets/analyze.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lexer"
+path = "fuzz_targets/lexer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "json"
+path = "fuzz_targets/json.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,46 @@
+name: Fuzz
+
+# Weekly, and on demand. Kept out of CI so a broken nightly toolchain never
+# blocks a merge; a crash here should become a regression test.
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Seconds to fuzz each target"
+        default: "60"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [analyze, lexer, json]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # The `nightly` branch of dtolnay/rust-toolchain; cargo-fuzz needs nightly.
+      - uses: dtolnay/rust-toolchain@0e28dd9a7764e5f83064112bb1f24025a14c313c # nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz ${{ matrix.target }}
+        env:
+          SECONDS_PER_TARGET: ${{ inputs.seconds || '60' }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          cd fuzz
+          cargo fuzz run "$TARGET" "corpus/$TARGET" -- \
+            -max_total_time="$SECONDS_PER_TARGET" -max_len=65536 -timeout=10
+      - name: Keep the crashing input
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-${{ matrix.target }}-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
