@@ -133,11 +133,28 @@ That's a well-behaved installer. Here's an excerpt of the report for
 
 ## Install
 
+Pick whichever tool you already have. All of them except `cargo install` fetch the same
+prebuilt, attested release binary for macOS or Linux (x86_64 and arm64), so you don't
+need Rust.
+
 ```sh
+# Homebrew (macOS and Linux)
+brew install rijuld/tap/soothsay
+
+# mise
+mise use -g github:rijuld/soothsay
+
+# cargo-binstall (downloads the binary, no compiling)
+cargo binstall soothsay
+
+# From source, if you have Rust
 cargo install --locked soothsay
 ```
 
-Or use a prebuilt binary for macOS or Linux (x86_64 and arm64) from the
+There's deliberately no `curl | sh` installer. You'd have to trust it before soothsay
+could tell you whether to.
+
+Or grab the binary yourself from the
 [releases page](https://github.com/rijuld/soothsay/releases/latest). Check the hash and
 the build attestation before you put it on your `PATH`:
 

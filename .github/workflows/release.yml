@@ -79,3 +79,45 @@ jobs:
           case "$TAG" in *-*) pre="--prerelease" ;; esac
           gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS $pre \
             --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes --verify-tag
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+
+  # Point `brew install rijuld/tap/soothsay` at the new binaries. Needs a
+  # HOMEBREW_TAP_TOKEN secret: a fine-grained token with Contents read/write on
+  # rijuld/homebrew-tap only. Without it, or for a pre-release, this is skipped.
+  homebrew:
+    needs: publish
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: SHA256SUMS
+      - name: Update the tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::notice::HOMEBREW_TAP_TOKEN isn't set; skipping the Homebrew tap update."
+            exit 0
+          fi
+          git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/rijuld/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          scripts/homebrew_formula.sh "$TAG" SHA256SUMS > tap/Formula/soothsay.rb
+          cd tap
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "Formula already up to date."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/soothsay.rb
+          git commit -m "soothsay ${TAG}"
+          git push origin HEAD

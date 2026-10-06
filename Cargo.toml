@@ -13,6 +13,13 @@ categories = ["command-line-utilities", "development-tools"]
 # Only what builds the crate; the plugin, fixtures and CI stay in the repo.
 include = ["src/**/*.rs", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
 
+# `cargo binstall soothsay` downloads the prebuilt release binary instead of
+# compiling. Must match the archive names in .github/workflows/release.yml.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }{ archive-suffix }"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
 [dependencies]
 # Deliberately none. A tool you pipe untrusted scripts into should be small
 # enough to audit in an afternoon.
